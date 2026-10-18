@@ -1,0 +1,55 @@
+{
+ "bars": 64,
+ "bpm": 90.0,
+ "form": [
+  [
+   "intro",
+   4
+  ],
+  [
+   "hook",
+   8
+  ],
+  [
+   "verse",
+   16
+  ],
+  [
+   "hook",
+   8
+  ],
+  [
+   "verse",
+   16
+  ],
+  [
+   "hook",
+   8
+  ],
+  [
+   "outro",
+   4
+  ]
+ ],
+ "duration_s": 171.55,
+ "gains": {
+  "kick": -11.7,
+  "snare": 0.0,
+  "hats": -6.5,
+  "piano": 3.3,
+  "cello": -3.1,
+  "strings": 1.2,
+  "bass": -15.3,
+  "swell": -0.1
+ },
+ "metrics": {
+  "lufs": -11.1,
+  "true_peak_dbtp": -1.0,
+  "crest_db": 10.68,
+  "low_le150_pct": 76.5,
+  "mid_250_2k_pct": 16.5,
+  "centroid_hz": 420.0,
+  "side_minus_mid_db": -15.9,
+  "lr_correlation": 0.95
+ }
+}

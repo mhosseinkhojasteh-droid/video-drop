@@ -1,0 +1,32 @@
+{
+ "C": {
+  "lufs": -10.11,
+  "true_peak_dbtp": -1.0,
+  "crest_db": 11.08,
+  "low_le150_pct": 53.9,
+  "mid_250_2k_pct": 31.5,
+  "centroid_hz": 444.0,
+  "side_minus_mid_db": -20.6,
+  "lr_correlation": 0.983
+ },
+ "A": {
+  "lufs": -10.05,
+  "true_peak_dbtp": -0.75,
+  "crest_db": 10.56,
+  "low_le150_pct": 65.5,
+  "mid_250_2k_pct": 23.7,
+  "centroid_hz": 369.0,
+  "side_minus_mid_db": -16.6,
+  "lr_correlation": 0.958
+ },
+ "B": {
+  "lufs": -10.03,
+  "true_peak_dbtp": -1.0,
+  "crest_db": 10.08,
+  "low_le150_pct": 83.8,
+  "mid_250_2k_pct": 10.5,
+  "centroid_hz": 347.0,
+  "side_minus_mid_db": -11.4,
+  "lr_correlation": 0.864
+ }
+}

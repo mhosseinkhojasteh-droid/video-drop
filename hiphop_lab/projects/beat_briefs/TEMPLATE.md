@@ -1,0 +1,14 @@
+# Beat brief — <title>
+- Archetype (producer_bible/archetype_matrix.csv):
+- Emotion engine (producer_bible.md §2):
+- One-sentence soul:
+- BPM / swing (hats) / key-mode:
+- Motif (1–2 bars, notes + rhythm, where is the rest?):
+- Drum architecture (kick/snare/hat 16-step + micro-timing):
+- Bass strategy (808 vs bass guitar vs upright; who owns 40–60 Hz):
+- Sound palette (library assets by manifest name):
+- Form (arrangement_principles.md template) + where the drop-outs are:
+- Vocal space plan (what thins under verses):
+- Targets: LUFS −10…−11, crest ≥ 11, ≤150 Hz %, side−mid, centroid (archetype row of archetype_stats.json)
+- Originality: what reference signature is this closest to, and why it is not a copy:
+- Render: script path; QC: analyze_track.py on the export, compare with the archetype range.

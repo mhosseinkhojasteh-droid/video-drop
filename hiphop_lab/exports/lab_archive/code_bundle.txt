@@ -1,0 +1,2230 @@
+=== FILE: scripts/analyze_track.py ===
+"""Phase 3: per-track measurement pipeline (machine measurements only, no listening claims).
+
+Usage: python3 -I scripts/analyze_track.py <audio> <out_json> [<out_png>]
+
+Every value written here is a signal measurement. Musical interpretation lives in the track reports.
+Known traps handled:
+  * beat trackers alias to 4/3, 3/2, 2x of the true tempo on swung hats -> tempo is chosen by a
+    comb over onset autocorrelation at 4/8/16 beats, then refined by a least-squares beat grid.
+  * peak onset energy in hip-hop sits on the snare (2 & 4) -> bar phase comes from 35-110 Hz kick energy.
+"""
+import sys, json, warnings
+import numpy as np, soundfile as sf, librosa, scipy.signal as ss, pyloudnorm as pyln
+warnings.filterwarnings('ignore')
+
+KEYS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+KK_MAJ = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+KK_MIN = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+TP_MAJ = np.array([0.748, 0.060, 0.488, 0.082, 0.670, 0.460, 0.096, 0.715, 0.104, 0.366, 0.057, 0.400])
+TP_MIN = np.array([0.712, 0.084, 0.474, 0.618, 0.049, 0.460, 0.105, 0.747, 0.404, 0.067, 0.133, 0.330])
+SR = 22050
+HOP = 256
+FPS = SR / HOP
+
+
+def bp(y, lo, hi, sr=SR, order=4):
+    if lo <= 0:
+        sos = ss.butter(order, hi, 'lowpass', fs=sr, output='sos')
+    elif hi >= sr / 2:
+        sos = ss.butter(order, lo, 'highpass', fs=sr, output='sos')
+    else:
+        sos = ss.butter(order, [lo, hi], 'bandpass', fs=sr, output='sos')
+    return ss.sosfiltfilt(sos, y)
+
+
+def onset_env(y):
+    S = np.abs(librosa.stft(y, n_fft=1024, hop_length=HOP))
+    S = np.log1p(100 * S)
+    d = np.maximum(0, np.diff(S, axis=1)).sum(0)
+    return np.r_[0, d]
+
+
+def key_scores(prof):
+    out = []
+    for name, maj, mn in (('kk', KK_MAJ, KK_MIN), ('temperley', TP_MAJ, TP_MIN)):
+        for i in range(12):
+            out.append((name, KEYS[i] + ' major', np.corrcoef(prof, np.roll(maj, i))[0, 1]))
+            out.append((name, KEYS[i] + ' minor', np.corrcoef(prof, np.roll(mn, i))[0, 1]))
+    return out
+
+
+CHORD_T = {}
+for i in range(12):
+    for q, iv in (('', (0, 4, 7)), ('m', (0, 3, 7)), ('7', (0, 4, 7, 10)), ('m7', (0, 3, 7, 10)), ('maj7', (0, 4, 7, 11)),
+                  ('dim', (0, 3, 6)), ('5', (0, 7))):
+        v = np.zeros(12); v[[(i + k) % 12 for k in iv]] = 1
+        CHORD_T[KEYS[i] + q] = v / np.linalg.norm(v)
+
+
+def chord_of(c):
+    c = c / (np.linalg.norm(c) + 1e-9)
+    best = sorted(((float(c @ v), k) for k, v in CHORD_T.items()), reverse=True)
+    return best[0][1], round(best[0][0], 2), best[1][1]
+
+
+def main(path, out_json, out_png=None):
+    x, sr0 = sf.read(path, always_2d=True)
+    res = {'file': path.split('/')[-1], 'sr_source': sr0, 'dur_s': round(len(x) / sr0, 2)}
+    # ---------- loudness / dynamics / stereo (source rate) ----------
+    meter = pyln.Meter(sr0)
+    res['lufs_integrated'] = round(meter.integrated_loudness(x), 2)
+    mono0 = x.mean(1)
+    res['sample_peak_dbfs'] = round(20 * np.log10(np.abs(x).max() + 1e-12), 2)
+    rms = np.sqrt(np.mean(mono0 ** 2))
+    res['crest_db'] = round(20 * np.log10(np.abs(mono0).max() / rms), 2)
+    M, S_ = (x[:, 0] + x[:, -1]) / 2, (x[:, 0] - x[:, -1]) / 2
+    res['side_minus_mid_db'] = round(10 * np.log10(np.mean(S_ ** 2) / np.mean(M ** 2) + 1e-12), 1)
+    lowM = bp(M, 0, 150, sr0); lowS = bp(S_, 0, 150, sr0)
+    res['side_minus_mid_below150_db'] = round(10 * np.log10(np.mean(lowS ** 2) / np.mean(lowM ** 2) + 1e-12), 1)
+    # short-term loudness spread (3 s windows)
+    win = int(3 * sr0); st = []
+    for i in range(0, len(x) - win, win):
+        l = meter.integrated_loudness(x[i:i + win]) if np.abs(x[i:i + win]).max() > 1e-4 else -70
+        if l > -60: st.append(l)
+    res['short_term_lufs_p10_p90'] = [round(float(np.percentile(st, 10)), 1), round(float(np.percentile(st, 90)), 1)] if st else None
+
+    y = librosa.resample(mono0, orig_sr=sr0, target_sr=SR)
+    # ---------- spectral balance ----------
+    spec = np.abs(librosa.stft(y, n_fft=4096, hop_length=2048)) ** 2
+    fr = librosa.fft_frequencies(sr=SR, n_fft=4096); tot = spec.sum()
+    bands = [(20, 40), (40, 60), (60, 100), (100, 150), (150, 250), (250, 500), (500, 1000), (1000, 2000), (2000, 4000), (4000, 8000), (8000, 11025)]
+    res['band_energy_pct'] = {f'{a}-{b}': round(100 * spec[(fr >= a) & (fr < b)].sum() / tot, 2) for a, b in bands}
+    cen = librosa.feature.spectral_centroid(S=np.sqrt(spec), sr=SR)[0]
+    res['spectral_centroid_hz_median'] = round(float(np.median(cen)), 0)
+    # rolloff for lossy-source detection (where content dies)
+    spec_db = 10 * np.log10(spec.mean(1) + 1e-20)
+    ref = spec_db[(fr > 1000) & (fr < 4000)].mean()
+    above = fr[spec_db > ref - 45]
+    res['hf_cutoff_hz_est'] = int(above.max()) if len(above) else None
+
+    # ---------- tempo: comb over bar-level autocorrelation ----------
+    oe = onset_env(y); oe = oe - ss.medfilt(oe, 31); oe[oe < 0] = 0
+    ac = np.correlate(oe, oe, 'full')[len(oe) - 1:]; ac /= ac[0] + 1e-9
+    cands = []
+    for bpm in np.arange(60, 180.01, 0.05):
+        b = 60 / bpm * FPS
+        s = sum(ac[int(round(k * b))] for k in (1, 2, 4, 8, 16) if int(round(k * b)) < len(ac))
+        cands.append((s, bpm))
+    cands.sort(reverse=True)
+    top = []
+    for s, b in cands:
+        if all(abs(b - t[1]) > 1.5 for t in top): top.append((round(float(s), 3), round(float(b), 2)))
+        if len(top) == 5: break
+    # prefer the hip-hop lane (70-115) among near-equal candidates (within 8 %)
+    best = top[0]
+    for s, b in top:
+        if 70 <= b <= 115 and s >= 0.92 * top[0][0]:
+            best = (s, b); break
+    bpm0 = best[1]
+    res['tempo_candidates_comb'] = top
+    # librosa tracker constrained near bpm0, then least-squares linear grid
+    _, beats = librosa.beat.beat_track(onset_envelope=oe, sr=SR, hop_length=HOP, start_bpm=bpm0, tightness=400)
+    bt = librosa.frames_to_time(beats, sr=SR, hop_length=HOP)
+    per0 = 60 / bpm0
+    # keep beats consistent with bpm0, fit t = off + k*per
+    k = np.round((bt - bt[0]) / per0)
+    A = np.vstack([k, np.ones_like(k)]).T
+    per, off = np.linalg.lstsq(A, bt, rcond=None)[0]
+    resid = bt - (off + k * per)
+    # robust refit
+    good = np.abs(resid) < 0.04
+    per, off = np.linalg.lstsq(A[good], bt[good], rcond=None)[0]
+    resid = bt[good] - (off + k[good] * per)
+    res['bpm'] = round(60 / per, 3)
+    res['bpm_fit_residual_ms_p90'] = round(float(np.percentile(np.abs(resid), 90) * 1000), 1)
+    res['bpm_alternatives'] = {'half': round(30 / per, 2), 'double': round(120 / per, 2)}
+    # grid drift test: per in first vs last third (tempo constant? drum machine vs live)
+    n = len(bt[good]); kk = k[good]; tt = bt[good]
+    if n > 30:
+        p1 = np.polyfit(kk[:n // 3], tt[:n // 3], 1)[0]; p3 = np.polyfit(kk[-n // 3:], tt[-n // 3:], 1)[0]
+        res['tempo_drift_pct_first_vs_last_third'] = round(100 * (p1 - p3) / p1, 3)
+
+    # ---------- bar phase by kick ----------
+    lo = np.abs(bp(y, 35, 110)); mid_sn = np.abs(bp(y, 150, 250)); hi_sn = np.abs(bp(y, 1500, 5000)); hat = np.abs(bp(y, 7000, 11000))
+    nbeats = int((len(y) / SR - off) / per)
+    beat_t = off + np.arange(nbeats) * per
+    while beat_t[0] - per > 0: beat_t = np.r_[beat_t[0] - per, beat_t]
+
+    def e_at(sig, t, w=0.07):
+        i = int(t * SR); return float(sig[max(0, i - int(0.01 * SR)):i + int(w * SR)].mean()) if 0 <= i < len(sig) - 10 else 0.0
+
+    kick_b = np.array([e_at(lo, t) for t in beat_t]); sn_b = np.array([e_at(hi_sn, t) for t in beat_t])
+    phase_score = []
+    for p in range(4):
+        # beat 1 = strong kick, beats 2 & 4 = strong snare
+        s1 = kick_b[p::4].mean(); s24 = sn_b[(p + 1) % 4::2].mean() / (sn_b.mean() + 1e-9)
+        phase_score.append(s1 / (kick_b.mean() + 1e-9) + 0.5 * s24)
+    ph = int(np.argmax(phase_score))
+    srt = sorted(phase_score, reverse=True)
+    res['bar_phase_margin'] = round(float(srt[0] - srt[1]), 3)
+    bar_starts = beat_t[ph::4]
+    res['first_downbeat_s'] = round(float(bar_starts[0]), 3)
+    res['snare_backbeat_ratio'] = round(float(sn_b[(ph + 1) % 4::2].mean() / (sn_b[ph::2].mean() + 1e-9)), 2)
+    barlen = 4 * per
+    bar_starts = bar_starts[bar_starts + barlen <= len(y) / SR]
+    res['n_bars'] = int(len(bar_starts)); res['bar_len_s'] = round(float(barlen), 4)
+
+    # ---------- 16-step drum occupancy + microtiming ----------
+    def band_onsets(sig_band):
+        e = librosa.onset.onset_strength(y=sig_band, sr=SR, hop_length=128)
+        pk, pr = ss.find_peaks(e, height=np.percentile(e, 80), distance=int(0.05 * SR / 128))
+        return pk * 128 / SR, pr['peak_heights']
+
+    yp = librosa.effects.percussive(y, margin=2.0)
+    grids = {}
+    micro = {}
+    for name, (lo_f, hi_f) in {'kick': (35, 110), 'snare': (1500, 5000), 'hat': (7000, 11000)}.items():
+        t_on, h_on = band_onsets(bp(yp, lo_f, hi_f))
+        g = np.zeros(16); dev = [[] for _ in range(16)]
+        step = barlen / 16
+        for t, h in zip(t_on, h_on):
+            j = np.searchsorted(bar_starts, t, side='right') - 1
+            if j < 0 or j >= len(bar_starts): continue
+            pos = (t - bar_starts[j]) / step
+            s = int(np.round(pos)) % 16
+            g[s] += h; dev[s].append((pos - np.round(pos)) * step * 1000)
+        g = g / (g.max() + 1e-9)
+        grids[name] = [round(float(v), 2) for v in g]
+        micro[name] = [round(float(np.median(d)), 1) if len(d) > 4 else None for d in dev]
+    res['drum_grid_16'] = grids
+    res['drum_microtiming_ms_16'] = micro
+    # swing: offbeat 16ths (steps 1,3,5..) delay vs straight, on hats
+    hs = [micro['hat'][i] for i in (2, 6, 10, 14) if micro['hat'][i] is not None]
+    h16 = [micro['hat'][i] for i in (1, 3, 5, 7, 9, 11, 13, 15) if micro['hat'][i] is not None]
+    res['hat_8th_offbeat_delay_ms'] = round(float(np.median(hs)), 1) if hs else None
+    res['hat_16th_offbeat_delay_ms'] = round(float(np.median(h16)), 1) if h16 else None
+    sixteenth_ms = barlen / 16 * 1000
+    if h16:
+        res['swing_pct_16th'] = round(50 + 50 * float(np.median(h16)) / sixteenth_ms, 1)  # 50 = straight, 66.7 = triplet
+
+    # ---------- per-bar features: layers, dropouts, chords ----------
+    harm = librosa.effects.harmonic(y, margin=2.0)
+    chroma = librosa.feature.chroma_cqt(y=harm, sr=SR, hop_length=512, bins_per_octave=36)
+    cfps = SR / 512
+    bass_chroma = librosa.feature.chroma_cqt(y=bp(harm, 0, 220), sr=SR, hop_length=512, fmin=librosa.note_to_hz('C1'), n_octaves=3)
+    bands_bar = {'sub_35_110': lo, 'lowmid_150_250': mid_sn, 'mid_250_2k': np.abs(bp(y, 250, 2000)), 'presence_2k_5k': hi_sn, 'air_7k_11k': hat}
+    harm_mid = np.abs(bp(harm, 250, 4000)); perc_all = np.abs(yp)
+    bars = []
+    for i, s in enumerate(bar_starts):
+        a, b = int(s * SR), int((s + barlen) * SR)
+        row = {'bar': i + 1, 't': round(float(s), 2)}
+        row['rms_db'] = round(20 * np.log10(np.sqrt(np.mean(y[a:b] ** 2)) + 1e-9), 1)
+        for k2, sig in bands_bar.items():
+            row[k2] = round(20 * np.log10(np.mean(sig[a:b]) + 1e-9), 1)
+        row['harm_mid_db'] = round(20 * np.log10(np.mean(harm_mid[a:b]) + 1e-9), 1)
+        row['perc_db'] = round(20 * np.log10(np.mean(perc_all[a:b]) + 1e-9), 1)
+        ca, cb = int(s * cfps), int((s + barlen) * cfps)
+        cvec = chroma[:, ca:cb].mean(1); bvec = bass_chroma[:, ca:cb].mean(1)
+        row['chroma'] = [round(float(v), 3) for v in cvec / (cvec.max() + 1e-9)]
+        row['chord'], row['chord_fit'], row['chord_alt'] = chord_of(cvec)
+        row['bass_pc'] = KEYS[int(np.argmax(bvec))]
+        # half-bar chords
+        hm = (ca + cb) // 2
+        row['chord_half'] = [chord_of(chroma[:, ca:hm].mean(1))[0], chord_of(chroma[:, hm:cb].mean(1))[0]]
+        row['bass_pc_beats'] = [KEYS[int(np.argmax(bass_chroma[:, int((s + q * per) * cfps):int((s + (q + 1) * per) * cfps)].mean(1)))] for q in range(4)]
+        bars.append(row)
+    res['bars'] = bars
+    # dropouts: bars where sub drops >= 6 dB below track median (kick/bass removed)
+    sub = np.array([r['sub_35_110'] for r in bars]); med = np.median(sub)
+    perc = np.array([r['perc_db'] for r in bars]); pmed = np.median(perc)
+    res['dropout_bars_sub'] = [r['bar'] for r in bars if r['sub_35_110'] < med - 6]
+    res['dropout_bars_perc'] = [r['bar'] for r in bars if r['perc_db'] < pmed - 6]
+    # harmonic loop length: chroma self-similarity at lags 1,2,4,8 bars
+    C = np.array([r['chroma'] for r in bars]); C = C - C.mean(0); C = C / (np.linalg.norm(C, axis=1, keepdims=True) + 1e-9)  # mean-centred: similarity of the bar-to-bar deviations
+    loop = {}
+    for L in (1, 2, 3, 4, 8):
+        if len(C) > L + 4: loop[L] = round(float(np.mean(np.sum(C[L:] * C[:-L], axis=1))), 3)
+    res['chroma_bar_lag_similarity'] = loop
+    # finer: beat-level chroma similarity at lags (beats) to find sub-bar loops
+    # key
+    prof = chroma.mean(1)
+    ks = key_scores(prof)
+    agg = {}
+    for meth, kname, v in ks: agg.setdefault(kname, []).append(v)
+    kr = sorted(((np.mean(v), k2) for k2, v in agg.items()), reverse=True)
+    res['key_candidates'] = [(k2, round(float(v), 3)) for v, k2 in kr[:4]]
+    res['key_confidence_margin'] = round(float(kr[0][0] - kr[1][0]), 3)
+    res['pitch_class_profile'] = {KEYS[i]: round(float(prof[i] / prof.max()), 2) for i in range(12)}
+    # bass pitch-class profile
+    bp_prof = bass_chroma.mean(1)
+    res['bass_pitch_class_profile'] = {KEYS[i]: round(float(bp_prof[i] / bp_prof.max()), 2) for i in range(12)}
+    # structure: novelty on per-bar feature vectors
+    F = np.array([[r['rms_db'], r['sub_35_110'], r['mid_250_2k'], r['presence_2k_5k'], r['air_7k_11k'], r['harm_mid_db'], r['perc_db']] + list(np.array(r['chroma']) * 3) for r in bars])
+    Fz = (F - F.mean(0)) / (F.std(0) + 1e-9)
+    nov = np.r_[0, np.linalg.norm(np.diff(Fz, axis=0), axis=1)]
+    thr = max(np.percentile(nov, 88), np.median(nov) * 2)
+    bounds = [0] + [i for i in range(1, len(nov)) if nov[i] >= thr and (i == 1 or nov[i] >= nov[i - 1])]
+    secs = []
+    for j, b0 in enumerate(bounds):
+        b1 = bounds[j + 1] if j + 1 < len(bounds) else len(bars)
+        seg = F[b0:b1]
+        secs.append({'start_bar': b0 + 1, 'n_bars': b1 - b0, 't_start': bars[b0]['t'], 'rms_db': round(float(seg[:, 0].mean()), 1),
+                     'sub': round(float(seg[:, 1].mean()), 1), 'mid': round(float(seg[:, 2].mean()), 1), 'air': round(float(seg[:, 4].mean()), 1),
+                     'harm_mid': round(float(seg[:, 5].mean()), 1), 'perc': round(float(seg[:, 6].mean()), 1)})
+    res['sections_auto'] = secs
+    # transient sharpness of kick/snare: median attack slope proxy (peak / mean in 30 ms)
+    res['perc_to_harm_ratio_db'] = round(float(20 * np.log10(np.sqrt(np.mean(yp ** 2)) / (np.sqrt(np.mean(harm ** 2)) + 1e-9))), 1)
+
+    json.dump(res, open(out_json, 'w'), ensure_ascii=False, indent=1)
+    if out_png:
+        import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(4, 1, figsize=(16, 13), gridspec_kw={'height_ratios': [2, 2, 2, 1.4]})
+        tb = [r['t'] for r in bars]
+        for k2 in ['sub_35_110', 'mid_250_2k', 'presence_2k_5k', 'air_7k_11k', 'harm_mid_db', 'perc_db']:
+            ax[0].plot(range(1, len(bars) + 1), [r[k2] for r in bars], label=k2)
+        for s in secs: ax[0].axvline(s['start_bar'], color='k', alpha=.3)
+        ax[0].legend(fontsize=7, ncol=6); ax[0].set_title(f"{res['file']}  |  {res['bpm']} BPM  |  key {res['key_candidates'][0][0]}  |  per-bar band energy (dB); lines = auto sections"); ax[0].set_xlabel('bar')
+        ax[1].imshow(C.T, aspect='auto', origin='lower', extent=[0.5, len(bars) + .5, -.5, 11.5], cmap='magma'); ax[1].set_yticks(range(12)); ax[1].set_yticklabels(KEYS); ax[1].set_title('chroma per bar')
+        S_db = librosa.amplitude_to_db(np.abs(librosa.stft(y[:int(min(len(y), (bar_starts[min(8, len(bar_starts) - 1)] + barlen) * SR))], n_fft=2048, hop_length=256)), ref=np.max)
+        ax[2].imshow(S_db[:600], aspect='auto', origin='lower', cmap='magma', vmin=-80); ax[2].set_title('spectrogram, first ~8 bars (0-6.5 kHz)')
+        G = np.array([grids['kick'], grids['snare'], grids['hat']])
+        ax[3].imshow(G, aspect='auto', cmap='Greys'); ax[3].set_yticks([0, 1, 2]); ax[3].set_yticklabels(['kick', 'snare', 'hat']); ax[3].set_xticks(range(16)); ax[3].set_xticklabels(['1', 'e', '&', 'a', '2', 'e', '&', 'a', '3', 'e', '&', 'a', '4', 'e', '&', 'a']); ax[3].set_title('16-step onset occupancy (whole track)')
+        plt.tight_layout(); plt.savefig(out_png, dpi=80); plt.close()
+
+
+if __name__ == '__main__':
+    main(*sys.argv[1:])
+
+=== FILE: scripts/build_reports.py ===
+"""Phase 4: assemble analysis/track_reports/<track>.md = interpretation (below) + measured card (make_cards.py).
+
+Tags: [measured] script output · [documented] public production history (recalled, verifiable) ·
+[estimate] low-confidence algorithm output · [hypothesis] musical interpretation not yet confirmed by ear · [unknown].
+The model has not listened to these records; every "sounds like" statement is a hypothesis for the King's ear.
+"""
+import os, glob
+
+R = {}
+
+R['Ice_Cube_Why_We_Thugs_Instrumental'] = dict(
+    title="Ice Cube — Why We Thugs (2006)", archetype="G-Unit/Storch-era street-club · West Coast attitude",
+    documented="Produced by Scott Storch [documented]. Laugh Now, Cry Later era.",
+    identity="Hard, bright, loop-driven street anthem. Constant energy (LUFS spread tiny), dense low end (77 % ≤150 Hz) [measured]. Emotion: defiance, swagger [hypothesis].",
+    groove="99.0 BPM, very stable grid; kick on 1 and around beat 3 region with snare on 2 & 4 [measured]. Hats sparse in occupancy → the rhythmic drive is carried by the melodic synth riff, not by a busy hat [hypothesis from occupancy + melody+ bars].",
+    harmony="Two-chord pendulum in the A–B–C area (chroma alternates A-minor-ish / B-ish every half bar) [estimate]. Storch signature: a single repeated synth/keys hook carrying the whole tension.",
+    structure="Arrangement by 8-bar 'melody+' blocks: bars 5–12, 29–36, 53–60, 77–84 add a melodic layer (hook sections) on a 24-bar cycle (16 verse + 8 hook) [measured timeline; section function = hypothesis].",
+    vocal="Mids are left open in verses (melody layer drops out), which is where the rapper sits; hooks add the lead synth [hypothesis].",
+    principles=["One unforgettable riff + constant drums; arrangement = adding/removing that riff in 8-bar blocks.", "Keep a 24-bar verse+hook cycle with no dead bars.", "Loud but not crushed: −9.4 LUFS with 11 dB crest."],
+    dont=["The riff's exact interval/rhythm sequence", "Its specific synth timbre combination"],
+    unknown=["Exact instrument identities", "Whether the hook layer is strings, synth brass or keys"])
+
+R['2pac_-_Ambitionz_Az_a_Ridah_Instrumental_HD_Quality'] = dict(
+    title="2Pac — Ambitionz Az a Ridah (1996)", archetype="West Coast · dark G-funk-adjacent, ominous",
+    documented="Produced by Daz Dillinger [documented]. All Eyez on Me.",
+    identity="Ominous, menacing West Coast. Chromatic pitch cluster (F#–G–G# all near max in the pitch-class profile and the bass profile) [measured] → a semitone-rubbing motif that creates dread [hypothesis].",
+    groove="87.3 BPM (tracker aliased to 118.6 = 4/3; corrected by comb) [measured]. Moderate swing 56.9 % with hats ~18–24 ms late on off-beats [measured] — laid-back West Coast pocket.",
+    harmony="Static tonal centre around G with chromatic neighbour tones (G–G#–F#) rather than chord changes [estimate]. Tension from half-steps, not from progressions.",
+    structure="Intro 2 bars without drums/low end; then the loop runs with single-bar full drop-outs (drums+hats removed) at bars 19, 55, 91 — a 36-bar period [measured] that marks section starts.",
+    vocal="Very low mid energy (250 Hz–2 kHz ≈ 4 %) [measured] → huge vocal space; the beat lives in sub-bass and top.",
+    principles=["Dread from semitone motion over a pedal tone.", "Single-bar total drop-out as the section marker (the MC enters alone).", "87 BPM + light swing = menace without rush."],
+    dont=["The specific chromatic synth line and its rhythm"],
+    unknown=["Synth source", "Exact bar/section functions (no vocal reference)"])
+
+R['50_Cent_-_Candy_Shop_instrumental'] = dict(
+    title="50 Cent — Candy Shop (2005)", archetype="G-Unit/Storch club · exotic-minor seduction",
+    documented="Produced by Scott Storch [documented]. The Massacre; features Olivia.",
+    identity="Seductive, exotic, minimal club record. 85 % of energy ≤150 Hz [measured] — the sub owns it; the melodic hook is sparse and modal.",
+    groove="98.0 BPM [measured]. Hat occupancy concentrated on beat 2 and 3-and (sparse) [measured]; a call-and-response between hook stabs and sub hits [hypothesis].",
+    harmony="F#-minor centre with the G (flat-2) prominent: bars alternate G-ish / F#-ish (Gmaj7/F#5 sketches) [estimate] → Phrygian colour (♭2 over the tonic) = the 'Middle-Eastern' flavour [hypothesis consistent with chroma].",
+    structure="4-bar cycle of variation: 'melody+' and 'hats+' bars recur every 4 bars (b9, 13, 33, 37, 41…; hats+ b6, 10, 14…) [measured] → ear-candy every 4th bar keeps a static loop alive.",
+    vocal="Mid band nearly empty [measured] → vocals and the female hook sit on top.",
+    principles=["Phrygian ♭2 against the tonic = instant exotic tension (and a Persian-friendly scale).", "Change something every 4th bar (fill, extra hat, hook stab) without changing the loop.", "Let the sub carry the groove; the melody only punctuates."],
+    dont=["The Candy Shop hook motif and its rhythmic placement"],
+    unknown=["Exact instrument (synth vs. sampled ethnic instrument)"])
+
+R['50_Cent_-_In_Da_Club'] = dict(
+    title="50 Cent — In Da Club (2003)", archetype="G-Unit/Dre club anthem",
+    documented="Produced by Dr. Dre with Mike Elizondo [documented]. Filename has no 'instrumental' → vocal presence NOT verified [unknown].",
+    identity="Sparse, bouncy, confident. Dynamic for a club record (−14.7 LUFS, crest 15.6 dB) [measured] — this rip is quieter than the others; don't copy its loudness.",
+    groove="89.9 BPM, hat swing ≈ 66 % (near triplet) [measured] → the famous bounce. Kick pattern dense around beat 1 and 2-and/3 [measured].",
+    harmony="C#-minor-ish centre, chroma moves D#–E–D around C# (bass E-D-C# walk) [estimate]; strings/keys stab figure.",
+    structure="Melody layer absent bars 1–5 and 15–21, 43–45, 51–53 [measured] → the hook instrumentation is switched off under verses — classic Dre subtraction arrangement.",
+    vocal="Vocal space created by removing the melodic stab in verses [hypothesis from timeline].",
+    principles=["Near-triplet hat swing (≈66 %) over straight kicks = bounce.", "Dre subtraction: same drums all song, melodic layer on/off defines verse vs hook.", "Few elements, each with its own frequency lane."],
+    dont=["The In Da Club string/synth stab figure and kick pattern combination"],
+    unknown=["Whether vocals are present in this file", "Section labels"])
+
+R['DJ_Premier_-_Classic_(instrumental)'] = dict(
+    title="DJ Premier — Classic (2007, Nike Air Force 1 anniversary)", archetype="NY boom-bap (Premier)",
+    documented="Produced by DJ Premier for Rakim, Nas, KRS-One and Kanye West [documented].",
+    identity="Triumphant, ceremonial boom-bap. Loudest reference (−8.5 LUFS, crest 10.7) [measured] — a modern Premier master.",
+    groove="99.99 BPM — drum-machine exact [measured]. Hats and melody alternate in a strict 2-bar call/response (bars even: hats+ melody+) [measured] → the classic Premier 2-bar chop.",
+    harmony="Minor-7 colour around B/F# (Bm7 ↔ F#maj7 alternation) [estimate] — chopped sample phrase.",
+    structure="Strict 2-bar alternation all the way (b3 full, b4 hats+melody+, …) [measured] — the arrangement is the chop itself.",
+    vocal="Mid band relatively busy (centroid higher) but the 2-bar call/response leaves 'answer' gaps for the rapper [hypothesis].",
+    principles=["The 2-bar chop: bar A states, bar B answers — the loop is a conversation.", "Machine-tight tempo, swing lives in the chop placement.", "Modern Premier masters are loud (−8.5 LUFS) yet keep ~10.7 dB crest."],
+    dont=["The specific sample phrase / chop points"],
+    unknown=["Original sample source"])
+
+R['DJ_Premier_-_Seen_it_All_(instrumental)'] = dict(
+    title="'Seen It All' (instrumental, attributed to DJ Premier in the filename)", archetype="Dark mafioso / NY boom-bap",
+    documented="[unknown] — record identity/credits not verified; the filename says DJ Premier.",
+    identity="Dark, mafioso, steady (no drop-outs in 66 bars) [measured]. C#-minor centre with m7 colour; 80 % ≤150 Hz [measured].",
+    groove="91.96 BPM, strong swing (72 % — beyond triplet, i.e. very late off-beat 16ths/hats) [measured; estimate of feel] → heavy laid-back walk.",
+    harmony="C#m7 ↔ E / C#5 alternation; bass C#–B–B–B then C#–C#–G#–C# [estimate] → minor 2-bar loop with a descending whole-step in the bass (C#→B).",
+    structure="One continuous loop, no measured drop-outs until the end [measured] → arrangement presumably done by the vocal and subtle filtering [hypothesis].",
+    vocal="Dark low-mid weighted bed; rapper sits above [hypothesis].",
+    principles=["Mafioso darkness = minor i–♭VII bass motion + heavy swing + no brightness.", "A loop can run 60+ bars if its internal 2-bar phrase has tension and release."],
+    dont=["The specific chop/sample"],
+    unknown=["Producer, sample, year"])
+
+R['Dr._Dre_-_Nuthin_But_A_G_Thang_(INSTRUMENTAL)'] = dict(
+    title="Dr. Dre — Nuthin' but a 'G' Thang (1992)", archetype="West Coast G-funk (canonical)",
+    documented="Produced by Dr. Dre; built on Leon Haywood 'I Want'a Do Something Freaky to You' (interpolated/sampled) [documented]. The Chronic.",
+    identity="Relaxed, sunny, funky. Very dynamic (crest 19.3 dB, −19.8 LUFS) [measured] — 1992 mastering, quieter era.",
+    groove="94.7 BPM, swing ≈ 60.6 % [measured] → loose funk pocket. Snare on 2 & 4 clean; hats on 8ths [measured].",
+    harmony="Major-7/minor-7 movement around B/F#/C (Bm7–Fmaj7 style alternation) [estimate] — soulful extended chords typical of G-funk.",
+    structure="Bars 51–54 and 63–70 alternate NO-LOW / low-thin [measured] → bass removed on alternating bars = a breakdown device. 'melody+' blocks at 27–30, 43–50, 59–62, 79–94 [measured] (G-funk lead / keys entries) [hypothesis].",
+    vocal="Mid-heavy for G-funk (64 % low) — keys and lead share the vocal range, so the lead plays only between/after lines [hypothesis].",
+    principles=["G-funk = extended chords (m7/maj7/9) + funk bass + whiny portamento lead used sparingly.", "Breakdown by removing the bass on alternate bars.", "Swing ~60 %: loose but not triplet."],
+    dont=["The Leon Haywood-derived progression + bass line", "The lead melody"],
+    unknown=["Exact chord qualities (needs transcription)"])
+
+R['Dr._Dre_-_The_Next_Episode_(Instrumental)'] = dict(
+    title="Dr. Dre — The Next Episode (1999)", archetype="West Coast 2001-era (cinematic G-funk)",
+    documented="Produced by Dr. Dre with Mel-Man; based on David McCallum's 'The Edge' [documented].",
+    identity="Cinematic, cocky, iconic guitar/bass figure. Intro bars 1–4 without drums (melody only) [measured].",
+    groove="95.4 BPM; kick on 1 with a dense 8th-ish kick pattern later in the bar [measured]; swing value not computed (insufficient off-beat hat onsets) [measured].",
+    harmony="D#/B power-chord bars then D#m7 ↔ F#maj7 alternation [estimate] — minor i ↔ relative major motion.",
+    structure="Intro 4 bars (no drums) → drums at bar 5; bars 29–32 drop drums again (break) [measured]; then every 4th bar 'melody-off' (b38, 42, 46…) [measured] → the riff rests on bar 4 of every 4-bar phrase, leaving a hole for the rapper's punchline.",
+    vocal="The 4-bar riff with a built-in rest bar = a punchline slot [hypothesis].",
+    principles=["Build the riff with a rest in bar 4 — the beat 'breathes' for the punchline.", "Drums-out break mid-song (4 bars) resets attention.", "Minor i ↔ relative major alternation = cool tension."],
+    dont=["The McCallum-derived riff", "The exact bass/guitar figure"],
+    unknown=["Instrumentation split (guitar vs. bass vs. keys)"])
+
+R['Dr_Dre-_Still_Dre_instrumental'] = dict(
+    title="Dr. Dre — Still D.R.E. (1999)", archetype="West Coast 2001-era (piano-led)",
+    documented="Produced by Dr. Dre and Mel-Man; the piano riff played by Scott Storch [documented].",
+    identity="Iconic, regal, minimal. Piano-only intro bars 1–3 (hats −42 dB → −29 dB at bar 5) [measured]. 105 bars with essentially no arrangement changes [measured] — the riff carries the whole record.",
+    groove="93.43 BPM; snare 2 & 4; strong late off-beats (swing ≈ 72.9 % on 16ths) [measured; estimate of feel].",
+    harmony="Strict 1-bar alternation of two pitch-sets (chroma flips A#/F ↔ E/A every bar) [measured on chroma plot] → a 2-bar riff of staccato piano chords.",
+    structure="Intro 4 bars piano (+strings) → full from bar 5 → no changes until outro [measured].",
+    vocal="Piano occupies 500 Hz–2 kHz (15.9 % — highest mid share of batch 1) but in short staccato hits, leaving gaps [measured + hypothesis].",
+    principles=["A staccato chord riff with rests can fill the mids without masking vocals.", "No arrangement needed if the 2-bar riff is strong enough — minimalism as confidence.", "Piano intro before drums: 4 bars."],
+    dont=["The Still D.R.E. piano riff (chord voicings + rhythm)", "Its string line"],
+    unknown=["Exact voicings (needs transcription)"])
+
+R['Fat_Joe_-_Lean_Back_(Instrumental)'] = dict(
+    title="Terror Squad (Fat Joe) — Lean Back (2004)", archetype="Storch-era club · Latin/East Coast",
+    documented="Produced by Scott Storch [documented].",
+    identity="Swaggering, half-time-feel club groove. Intro 4 bars without drums [measured]. Bass/keys stab pattern with recurring 'low-thin' bars every 4 bars (b6, 14, 18, 22, 30…) [measured] → planned bass rests.",
+    groove="95.1 BPM; kick only on 1 and 3 (X.........X.....) [measured] — extremely sparse kick; snare/claps carry the rhythm.",
+    harmony="G#/D# centre with A natural colour (Amaj7 vs G# bars) [estimate] → semitone shift (♭2 colour again, Storch habit).",
+    structure="4-bar intro; then a 4-bar cell where bar 2 drops the low end — the 'lean back' space [measured + hypothesis].",
+    vocal="Sparse kick + bass rests = room for call-and-response chant hooks [hypothesis].",
+    principles=["Two kicks per bar can be enough if the snare/clap and bass hits are syncopated.", "Planned bass rests every 4 bars create a dance 'move' moment.", "Storch ♭2 semitone colour reappears (Candy Shop, Lean Back)."],
+    dont=["The Lean Back stab rhythm and melodic figure"],
+    unknown=["Instrument identities"])
+
+R['G_Unit_-_Poppin__Them_Thangs'] = dict(
+    title="G-Unit — Poppin' Them Thangs (2003)", archetype="G-Unit street anthem (piano-led, aggressive)",
+    documented="Produced by Scott Storch [documented, moderate confidence — verify].",
+    identity="Aggressive, militant, piano-driven. Lowest low-end share of all (30.6 % ≤150 Hz) [measured] → mid-forward record: the piano/keys hit hard in the mids. Loud (−8.0 LUFS) [measured].",
+    groove="88.0 BPM, swing 66 % (triplet feel) [measured]. 8th hats straight-through [measured].",
+    harmony="F#-minor, bars alternate F#m ↔ Bm7 with bass F#–F–E / F#–D#–B descent [estimate] → chromatic descending bass under a minor i–iv = menace.",
+    structure="Almost no layer changes (b1–94 full) [measured] → the drama is in the riff, not the arrangement.",
+    vocal="Mid-forward beat → vocals must be EQ'd to cut through, or the piano must leave rhythmic gaps [hypothesis].",
+    principles=["Chromatic descending bass line under i–iv minor = street menace.", "Aggression can come from mid-range piano hits instead of sub.", "Triplet-swung hats at 88 BPM."],
+    dont=["The piano riff"],
+    unknown=["Producer verification", "Exact piano voicings"])
+
+R['Jay-Z_-_Blueprint_2_(Instrumental)'] = dict(
+    title="Jay-Z — Blueprint² (title track, 2002)", archetype="Soulful/cinematic East Coast",
+    documented="[unknown] producer not verified here.",
+    identity="Reflective, grand. Long intro: bars 1–16 have no drums and no low end [measured] (sample breathing alone). Dynamic master (−15.7 LUFS, crest 17.4) [measured].",
+    groove="90.0 BPM, swing ≈ 72 % [measured]. Kick pattern X...x..X..X.x..x [measured].",
+    harmony="Static C-major-7 / E-bass colour for the first bars (Cmaj7 over E) [estimate] → a suspended, unresolved soul sample.",
+    structure="16-bar drumless intro; then melody+ blocks of 2–4 bars alternating with full bars (b17–18, 21–26, 29–32, 49–50, 53–56, 73–74, 77–80) [measured].",
+    vocal="Low-end only half the energy (50 % ≤150 Hz) → mids carry the sample; vocal competes, so the sample must duck or thin under verses [hypothesis].",
+    principles=["A long drumless intro (16 bars) is legitimate when the sample has narrative weight.", "Maj7-over-3rd voicing = unresolved, reflective."],
+    dont=["The sample/chop"],
+    unknown=["Producer and sample source"])
+
+R['Kendrick_Lamar_-_Bitch,_Don_t_Kill_My_Vibe_[Instrumental]'] = dict(
+    title="Kendrick Lamar — Bitch, Don't Kill My Vibe (2012)", archetype="Soulful / laid-back modern West Coast",
+    documented="Produced by Sounwave; sample: Boom Clap Bachelors 'Tiden Flyver' [documented, moderate confidence — verify].",
+    identity="Dreamy, hazy, floating. 134.0 BPM in double-time = 67 BPM half-time feel [measured + interpretation]. Intro bars 1–22 have no drums/low end [measured].",
+    groove="Kick on quarter notes in the double-time grid (X...X.x.X.x.X.x.) [measured] — reads as a half-time 67 BPM with 8th-note pulse.",
+    harmony="C# major-7 centre with F#maj7 (IV) colour [estimate] → major-7 dream harmony (no minor darkness).",
+    structure="Long intro (22 bars in 134-grid = 11 bars half-time); repeated big drop-outs b57–70 (14 bars, no drums/low) [measured] — breakdowns around the hook.",
+    vocal="84 % ≤150 Hz but hazy top; lots of space [measured + hypothesis].",
+    principles=["Half-time at ~67 BPM gives 'vibe' — space for melodic flows.", "Maj7 (I–IV) harmony = calm confidence instead of menace.", "Long drumless passages as emotional reset."],
+    dont=["The Tiden Flyver sample/vocal chop"],
+    unknown=["Sample treatment details"])
+
+R['Mathematics,_Method_Man,_AZ,_Wu_Tang_Clan_God_Body_INSTRUMENTA'] = dict(
+    title="Mathematics feat. Method Man & AZ — God Body (Wu-Tang family)", archetype="Wu-Tang / gritty NY",
+    documented="Producer Mathematics [documented as artist; production credit not verified here].",
+    identity="Gritty, dense, loud (−8.6 LUFS, crest 10.8) [measured]. Runs bars 2–63 without any layer change [measured].",
+    groove="81.0 BPM — slowest of the set [measured]. Swing 59.5 % [measured]. Kick syncopated off the 1 (..x.X..X..X.x.xx) [measured; downbeat phase margin should be checked].",
+    harmony="D minor area with Eb (♭2) colour (D#maj7/Em7 alternation) [estimate] → semitone-shifted sample = Wu dissonance.",
+    structure="Continuous loop [measured].",
+    vocal="Dense bed; the vocal must be bright and forward [hypothesis].",
+    principles=["81 BPM + ♭2 dissonance + grit = Wu weight.", "One loop for 60+ bars with three MCs carrying the variation."],
+    dont=["The sample"],
+    unknown=["Sample source", "Exact bar phase (syncopated kick)"])
+
+R['Mobb_Deep_-_Burn_(Instrumentals)'] = dict(
+    title="Mobb Deep — Burn (Infamy era, 2001)", archetype="Dark NY / mafioso",
+    documented="Mobb Deep record; production credit not verified here (likely Havoc) [unknown].",
+    identity="Dark, steady, heavy low end (86.7 % ≤150 Hz — highest) [measured]. No layer changes bars 1–94 [measured].",
+    groove="95.6 BPM; kick X...x..xX.X.x... [measured].",
+    harmony="Dominant-7 colours (G7, A7, E7) with chromatic bass A–G–D–C / F–F–D–A [estimate] → bluesy, unresolved dominant chain.",
+    structure="Continuous loop, outro drop at b96 [measured].",
+    vocal="Huge sub, quiet mids → vocals sit easily [hypothesis].",
+    principles=["Dominant-7 chains without resolution = unease.", "When the sub carries 87 % of the energy, every other element must be thin and dark."],
+    dont=["The loop"],
+    unknown=["Producer, sample"])
+
+R['Mobb_Deep_Shook_Ones,_Pt_II_Instrumental'] = dict(
+    title="Mobb Deep — Shook Ones, Pt. II (1995)", archetype="Gritty underground NY (canonical)",
+    documented="Produced by Havoc; contains a sped/pitched Herbie Hancock 'Jessica' piano fragment and other jazz samples [documented, moderate confidence — verify]. 128 kbps source [measured].",
+    identity="Paranoid, cold, claustrophobic. G-minor, pitch profile spread (dissonant cluster) [measured/estimate].",
+    groove="93.97 BPM; busy kick (x.x.xXX.x.X.xxX.) [measured] — the famous dense, stumbling kick pattern feel.",
+    harmony="G-minor with a dissonant high piano figure [estimate]; Gm7/Cm7 sketches.",
+    structure="Intro 6 bars: drums/low enter and leave (b1–3 none, b4–5 partial, b6 none) [measured] → teasing intro; melody-off block b37–40 [measured].",
+    vocal="Mid band quiet, the high piano stab sits above the vocal range [hypothesis].",
+    principles=["Dissonant, tiny, high-register loop + heavy sub = paranoia.", "Intro that teases the drums before committing.", "Kick density as aggression (busy kick, plain snare)."],
+    dont=["The piano fragment / sample", "The exact kick pattern"],
+    unknown=["Sample sources (verify)"])
+
+R['Mobb_Deep_Survival_Of_The_Fittest_Instrumental'] = dict(
+    title="Mobb Deep — Survival of the Fittest (1995)", archetype="Gritty underground NY",
+    documented="Produced by Mobb Deep (Havoc) [documented]; jazz piano sample (reportedly Barry Harris 'Skylark') [documented, moderate confidence — verify]. 128 kbps source.",
+    identity="Bleak, haunting. Intro bars 1–6 with no drums [measured]; then a strict 2-bar alternation (odd bars full, even bars melody+) [measured] — a 2-bar sample phrase where bar 2 carries the melodic tail.",
+    groove="95.15 BPM; kick X.X....xX.x....x, snare on 2 & 4 [measured].",
+    harmony="E/F semitone (Fmaj7 chroma over E bass) [estimate] → ♭2 over the bass = haunted.",
+    structure="6-bar drumless intro, then the 2-bar call/response loop for the whole song [measured].",
+    vocal="Bass pedal on E keeps the floor fixed while the sample moves above [hypothesis].",
+    principles=["♭II over the root (F over E) = haunting.", "2-bar sample phrase where bar 2 'answers' — loop as a sentence.", "6-bar drumless intro for mood."],
+    dont=["The piano sample"],
+    unknown=["Sample verification"])
+
+R['Nas_-_N_Y._State_Of_Mind_Instrumental'] = dict(
+    title="Nas — N.Y. State of Mind (1994)", archetype="DJ Premier NY boom-bap (canonical)",
+    documented="Produced by DJ Premier; samples Joe Chambers 'Mind Rain' (piano) and Donald Byrd 'Flight Time' [documented].",
+    identity="Tense, nocturnal, cinematic street noir. 84.5 BPM [measured].",
+    groove="84.48 BPM; swing 69 % [measured]. Kick X.xxx....xX.x..X (chopped, irregular) [measured] → Premier's syncopated, chopped-break feel.",
+    harmony="F#/C# area with diminished colour (Ddim/C#7 sketches) [estimate] → dark jazz piano dissonance.",
+    structure="Intro alternating low-thin/full bars (b1–5) [measured]; hats+ blocks b49–52 and b89–99 [measured] → hat density raised in later sections.",
+    vocal="Mid 65 % low share; the jazz piano sits in short stabs [hypothesis].",
+    principles=["Jazz dissonance (dim/7♭9) chopped into short stabs = noir.", "84 BPM + 69 % swing = heavy walking pocket.", "Raise hat density for later verses instead of adding instruments."],
+    dont=["The Mind Rain piano chop", "Flight Time bass"],
+    unknown=["Exact chop points"])
+
+R['Nas_-_Nas_Is_Like_(Instrumental)_-_HQ'] = dict(
+    title="Nas — Nas Is Like (1999)", archetype="DJ Premier NY boom-bap",
+    documented="Produced by DJ Premier [documented]. I Am… era.",
+    identity="Ceremonial, stately. Intro bars 1–8 low-thin/melody-off [measured] → 8-bar intro with the cut/scratch or thin sample before full drums.",
+    groove="94.5 BPM; swing 74 % (very late hats) [measured; estimate of feel].",
+    harmony="Semitone neighbour A ↔ A# / G# ↔ A alternation (Amaj7/A#7) [estimate] → Premier's chromatic chop shift.",
+    structure="Full drop-outs at b28 and b82 (single bars) [measured] → classic one-bar break before a new section; melody-off b91–93 into the outro [measured].",
+    vocal="Premier leaves space for scratched hooks (cuts) [documented habit; hypothesis here].",
+    principles=["One-bar full stop before the hook/verse = punctuation.", "Chromatic semitone chop shift (A ↔ A#) as the 'turn' of the loop.", "8-bar intro."],
+    dont=["The sample chop"],
+    unknown=["Sample source"])
+
+R['Raekwon_-_Ice_Cream_(Instrumental)_[Track_13]'] = dict(
+    title="Raekwon — Ice Cream (1995)", archetype="Wu-Tang mafioso / soulful-dark",
+    documented="Produced by RZA [documented]. Only Built 4 Cuban Linx… Sample attributions not verified here.",
+    identity="Smooth-menacing, mafioso cool. Essentially MONO (side−mid −40 dB) [measured] — 90s Wu mixes are mono-centred; percussion 9.3 dB above harmonic content [measured] → drums dominate.",
+    groove="89.6 BPM, swing 66 % (triplet) [measured]; hats 26 ms late on off-8ths [measured].",
+    harmony="C#-minor area with dominant-7 colours (D#7, F#7, A7) [estimate] → soul-sample chords.",
+    structure="Single/two-bar full drop-outs at b47, b68–69, b83 [measured] (section markers); many single 'melody+' bars every 4 bars [measured] → sample phrase accent on bar 4.",
+    vocal="Mono, mid-quiet bed; vocals centre [hypothesis].",
+    principles=["Mono-centred mix = old-school weight; width is not required for impact.", "Drums louder than the sample (+9 dB perc vs harmonic) = RZA grit.", "Drop-out bars as section markers."],
+    dont=["The sample and its chop"],
+    unknown=["Sample sources"])
+
+R['Wu_Tang_Clan_-_Triumph_Instrumental'] = dict(
+    title="Wu-Tang Clan — Triumph (1997)", archetype="Wu-Tang / martial-arts cinematic",
+    documented="Produced by RZA [documented]. Wu-Tang Forever.",
+    identity="Epic, militant, cinematic. MONO file (side−mid −72 dB) [measured]. Very dynamic (−16 LUFS, crest 14.9) [measured]. 127 bars, longest reference.",
+    groove="91.0 BPM, swing 64 % [measured]. Kick on every quarter in the first half (X.X.X.X.X...) [measured] — marching.",
+    harmony="Power-fifth sketches D5/G5 with a D bass pedal [estimate] → modal (no 3rds) = martial/medieval.",
+    structure="Intro bars 1–8 melody+ (string/horn statement) [measured]; then long continuous verse sections with melody-off pockets (b85, 88–91, 103, 105) [measured] — 9 MCs, the arrangement is the verse order.",
+    vocal="Modal, open fifths leave all harmonic room for vocals [hypothesis].",
+    principles=["Open fifths + pedal bass = martial/cinematic (no major/minor commitment).", "Marching quarter-note kick for militancy.", "8-bar orchestral intro statement."],
+    dont=["The sample/horn line"],
+    unknown=["Sample source; exact instrumentation"])
+
+
+def main():
+    os.makedirs('analysis/track_reports', exist_ok=True)
+    n = 0
+    for name, d in R.items():
+        card = open(f'analysis/data/{name}.card.md').read()
+        md = f"""# {d['title']}
+
+**Archetype:** {d['archetype']}  ·  **Source file:** `references/raw/` ({name})
+**Evidence status:** measured by script; NOT listened to by the model. Every [hypothesis] needs the King's ear.
+
+## 1. Identity & emotional character
+{d['identity']}
+
+**Production history:** {d['documented']}
+
+## 2–3. Tempo, groove, timing
+{d['groove']}
+
+## 4–6. Drums, bass, harmony & texture
+{d['harmony']}
+
+## 7–9. Structure, sections, layer changes
+{d['structure']}
+Full per-bar map: `analysis/structural_maps/{name}.csv` · plot: `analysis/plots/{name}.png`
+
+## 11. Vocal compatibility
+{d['vocal']}
+
+## 12. Transferable principles
+""" + '\n'.join(f'- {p}' for p in d['principles']) + """
+
+## 13. Signature elements that must NOT be reproduced
+""" + '\n'.join(f'- {p}' for p in d['dont']) + """
+
+## 14. Open questions / needed evidence
+""" + '\n'.join(f'- {p}' for p in d['unknown']) + "\n\n" + card
+        open(f'analysis/track_reports/{name}.md', 'w').write(md); n += 1
+    missing = [os.path.basename(p)[:-8] for p in glob.glob('analysis/data/*.card.md') if os.path.basename(p)[:-8] not in R]
+    print(n, 'reports written; missing interpretations:', missing)
+
+
+if __name__ == '__main__':
+    main()
+
+=== FILE: scripts/inventory.py ===
+"""Phase 2: reproducible inventory of reference audio. Usage: python3 -I scripts/inventory.py references/raw reports/01_asset_inventory.csv"""
+import sys, os, csv, hashlib, json, subprocess
+src, out = sys.argv[1], sys.argv[2]
+rows = []
+for f in sorted(os.listdir(src)):
+    p = os.path.join(src, f)
+    if not f.lower().endswith(('.mp3', '.wav', '.flac', '.m4a', '.aiff', '.ogg')): continue
+    h = hashlib.sha256(open(p, 'rb').read()).hexdigest()
+    pr = json.loads(subprocess.run(['ffprobe', '-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', p], capture_output=True, text=True).stdout)
+    st = [s for s in pr['streams'] if s['codec_type'] == 'audio'][0]
+    dec = subprocess.run(['ffmpeg', '-v', 'error', '-i', p, '-f', 'null', '-'], capture_output=True, text=True).stderr.strip()
+    rows.append(dict(filename=f, path=p, sha256=h[:16], size_bytes=os.path.getsize(p), codec=st['codec_name'],
+                     sample_rate=st['sample_rate'], channels=st['channels'], bit_rate=pr['format'].get('bit_rate'),
+                     duration_s=round(float(pr['format']['duration']), 2), decode_errors=len(dec.splitlines()) if dec else 0,
+                     tags=json.dumps(pr['format'].get('tags', {}), ensure_ascii=False)[:200]))
+seen = {}
+for r in rows:
+    r['duplicate_of'] = seen.get(r['sha256'], ''); seen.setdefault(r['sha256'], r['filename'])
+with open(out, 'w', newline='') as fh:
+    w = csv.DictWriter(fh, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
+print(len(rows), 'files ->', out)
+
+=== FILE: scripts/make_cards.py ===
+"""Builds the measured part of every track report + structural maps + the technical CSV from analysis/data/*.json.
+
+Usage: python3 -I scripts/make_cards.py
+Outputs: analysis/structural_maps/<track>.csv, analysis/data/<track>.card.md (measured section only),
+         reports/02_audio_technical_analysis.csv
+"""
+import json, glob, os, csv
+import numpy as np
+
+STEPS = ['1', 'e', '&', 'a', '2', 'e', '&', 'a', '3', 'e', '&', 'a', '4', 'e', '&', 'a']
+
+
+def grid_str(g, thr=0.45):
+    return ''.join('X' if v >= 0.75 else 'x' if v >= thr else '.' for v in g)
+
+
+def phrase_view(d):
+    """Group consecutive bars with similar energy/layer profile; report sub/perc dropouts and layer adds."""
+    bars = d['bars']
+    sub = np.array([b['sub_35_110'] for b in bars]); perc = np.array([b['perc_db'] for b in bars])
+    air = np.array([b['air_7k_11k'] for b in bars]); hm = np.array([b['harm_mid_db'] for b in bars])
+    med = {k: float(np.median(v)) for k, v in (('sub', sub), ('perc', perc), ('air', air), ('hm', hm))}
+    tags = []
+    for i, b in enumerate(bars):
+        t = []
+        if sub[i] < med['sub'] - 6: t.append('NO-LOW')
+        elif sub[i] < med['sub'] - 3: t.append('low-thin')
+        if perc[i] < med['perc'] - 6: t.append('NO-DRUMS')
+        if air[i] < med['air'] - 6: t.append('no-hats')
+        elif air[i] > med['air'] + 3: t.append('hats+')
+        if hm[i] > med['hm'] + 3: t.append('melody+')
+        elif hm[i] < med['hm'] - 6: t.append('melody-off')
+        tags.append(','.join(t) if t else 'full')
+    return tags
+
+
+def main():
+    rows = []
+    for jp in sorted(glob.glob('analysis/data/*.json')):
+        d = json.load(open(jp)); name = os.path.basename(jp)[:-5]
+        tags = phrase_view(d)
+        with open(f'analysis/structural_maps/{name}.csv', 'w', newline='') as fh:
+            w = csv.writer(fh); w.writerow(['bar', 't_s', 'state', 'rms_db', 'sub', 'perc', 'air', 'harm_mid', 'chord_est', 'chord_half_est', 'bass_pc_beats'])
+            for b, tg in zip(d['bars'], tags):
+                w.writerow([b['bar'], b['t'], tg, b['rms_db'], b['sub_35_110'], b['perc_db'], b['air_7k_11k'], b['harm_mid_db'], b['chord'], '|'.join(b['chord_half']), '-'.join(b['bass_pc_beats'])])
+        # compressed state timeline
+        segs = []; cur = tags[0]; st = 1
+        for i, tg in enumerate(tags[1:], 2):
+            if tg != cur: segs.append((st, i - 1, cur)); cur, st = tg, i
+        segs.append((st, len(tags), cur))
+        timeline = ' | '.join(f"b{a}-{b}:{s}" if a != b else f"b{a}:{s}" for a, b, s in segs)
+        # first 8 bars chord/bass sequence (loop identity, estimate)
+        seq = ' '.join(f"[{'/'.join(b['chord_half'])} bass {'-'.join(b['bass_pc_beats'])}]" for b in d['bars'][1:9])
+        g = d['drum_grid_16']; mt = d['drum_microtiming_ms_16']
+        be = d['band_energy_pct']
+        low = sum(v for k, v in be.items() if int(k.split('-')[1]) <= 150)
+        card = f"""## Measured profile [measured — scripts/analyze_track.py → analysis/data/{name}.json]
+
+| metric | value |
+|---|---|
+| duration | {d['dur_s']} s, {d['n_bars']} bars of {d['bar_len_s']} s |
+| tempo | **{d['bpm']} BPM** (grid residual p90 {d['bpm_fit_residual_ms_p90']} ms; comb candidates {d['tempo_candidates_comb'][:3]}; drift first→last third {d.get('tempo_drift_pct_first_vs_last_third')} %) |
+| first downbeat | {d['first_downbeat_s']} s (bar-phase margin {d['bar_phase_margin']}; snare backbeat ratio {d['snare_backbeat_ratio']}) |
+| key | {d['key_candidates'][0][0]} [estimate, margin {d['key_confidence_margin']}]; alternatives {d['key_candidates'][1:3]} |
+| loudness | {d['lufs_integrated']} LUFS integrated, short-term p10/p90 {d['short_term_lufs_p10_p90']}, crest {d['crest_db']} dB, sample peak {d['sample_peak_dbfs']} dBFS |
+| stereo | side−mid {d['side_minus_mid_db']} dB overall, {d['side_minus_mid_below150_db']} dB below 150 Hz |
+| spectrum | {round(low,1)} % of energy ≤150 Hz; centroid {d['spectral_centroid_hz_median']} Hz; HF content to ~{d['hf_cutoff_hz_est']} Hz |
+| swing (hat 16ths) | {d.get('swing_pct_16th')} % (50 straight, 66.7 triplet); off-8th hat delay {d['hat_8th_offbeat_delay_ms']} ms |
+| perc vs harmonic | {d['perc_to_harm_ratio_db']} dB |
+| harmonic loop similarity (bar lags) | {d['chroma_bar_lag_similarity']} |
+
+**16-step onset occupancy** (X strong, x present; whole track):
+```
+        {' '.join(STEPS)}
+kick    {' '.join(grid_str(g['kick']))}
+snare   {' '.join(grid_str(g['snare']))}
+hat     {' '.join(grid_str(g['hat']))}
+```
+Median micro-timing per step (ms, + = late): kick {mt['kick']}, snare {mt['snare']}, hat {mt['hat']}
+
+**Layer timeline** (per bar vs. track median; NO-LOW = sub ≥6 dB down, NO-DRUMS = percussive ≥6 dB down):
+{timeline}
+
+**Bars 2–9 harmonic sketch** [estimate: chroma template + bass chroma; not a transcription]: {seq}
+
+Pitch-class profile: {d['pitch_class_profile']}
+Bass pitch-class profile: {d['bass_pitch_class_profile']}
+"""
+        open(f'analysis/data/{name}.card.md', 'w').write(card)
+        rows.append(dict(track=name, dur_s=d['dur_s'], bpm=d['bpm'], key_est=d['key_candidates'][0][0], key_margin=d['key_confidence_margin'],
+                         lufs=d['lufs_integrated'], crest_db=d['crest_db'], side_mid_db=d['side_minus_mid_db'], low_le150_pct=round(low, 1),
+                         centroid_hz=d['spectral_centroid_hz_median'], swing16=d.get('swing_pct_16th'), hat8_delay_ms=d['hat_8th_offbeat_delay_ms'],
+                         perc_vs_harm_db=d['perc_to_harm_ratio_db'], bars=d['n_bars'], kick=grid_str(g['kick']), snare=grid_str(g['snare']), hat=grid_str(g['hat']),
+                         dropouts_low=' '.join(map(str, d['dropout_bars_sub'])), dropouts_drums=' '.join(map(str, d['dropout_bars_perc'])), hf_cutoff=d['hf_cutoff_hz_est']))
+    with open('reports/02_audio_technical_analysis.csv', 'w', newline='') as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
+    print(len(rows), 'cards')
+
+
+if __name__ == '__main__':
+    main()
+
+=== FILE: scripts/run_all.sh ===
+#!/bin/bash
+# Phase 3 batch runner: analyses every reference in references/raw (4 in parallel), skips finished ones.
+cd "$(dirname "$0")/.."
+ls references/raw | while read f; do
+  n="${f%.*}"; n="${n// /_}"
+  [ -s "analysis/data/$n.json" ] || echo "$f"
+done | xargs -P 4 -I{} bash -c 'f="{}"; n="${f%.*}"; n="${n// /_}"; python3 -I scripts/analyze_track.py "references/raw/$f" "analysis/data/$n.json" "analysis/plots/$n.png" > "analysis/data/$n.log" 2>&1 && echo "OK $n" || echo "FAIL $n"'
+
+=== FILE: scripts/setup_env.sh ===
+#!/bin/bash
+# Rebuilds the production environment in a fresh cloud container (containers are ephemeral).
+# Everything here is free/open-source and fetched from apt, PyPI or GitHub releases (the hosts this environment allows).
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q sox libsox-fmt-all fluidsynth rubberband-cli p7zip-full unar \
+  dragonfly-reverb-vst3 dpf-plugins-vst3 fluid-soundfont-gm avldrums.lv2-soundfont
+pip install -q librosa scipy soundfile pyloudnorm pedalboard matplotlib mido pretty_midi libarchive-c
+T=$(mktemp -d)
+curl -sL -o $T/surge.deb https://github.com/surge-synthesizer/releases-xt/releases/download/1.3.4/surge-xt-linux-x64-1.3.4.deb
+curl -sL -o $T/chow.deb https://github.com/jatinchowdhury18/AnalogTapeModel/releases/download/v2.11.4/ChowTapeModel-Linux-x64-2.11.4.deb
+apt-get install -y -q $T/surge.deb $T/chow.deb
+curl -sL -o $T/dexed.zip https://github.com/asb2m10/dexed/releases/download/v1.0.1/Dexed-1.0.1-lnx.zip
+unzip -o -q $T/dexed.zip -d $T/dexed && cp -r $T/dexed/Dexed.vst3 /usr/lib/vst3/
+# sample libraries (shallow git clones; licences recorded in sound_library/asset_manifest.csv)
+cd "$(dirname "$0")/../sound_library/incoming"
+for r in sfzinstruments/SalamanderGrandPiano sfzinstruments/virtuosity_drums sgossner/VSCO-2-CE \
+         sfzinstruments/karoryfer.meatbass sfzinstruments/karoryfer.big-rusty-drums sfzinstruments/karoryfer.growlybass \
+         sfzinstruments/SplendidGrandPiano sfzinstruments/karoryfer.black-and-green-guitars sfzinstruments/karoryfer.bear-sax; do
+  n=$(basename $r); [ -d $n ] || git clone -q --depth 1 https://github.com/$r $n
+done
+echo "environment ready"
+
+=== FILE: scripts/engine/dsp.py ===
+"""DSP building blocks: drum synthesis, vintage sampler emulation, saturation, EQ helpers, loudness."""
+import numpy as np, scipy.signal as ss
+from scipy.signal import resample_poly
+
+SR = 48000
+
+
+def _sos(kind, f, sr=SR, order=2):
+    return ss.butter(order, f, kind, fs=sr, output='sos')
+
+
+def hp(x, f, sr=SR, order=2): return ss.sosfilt(_sos('highpass', f, sr, order), x, axis=0)
+def lp(x, f, sr=SR, order=2): return ss.sosfilt(_sos('lowpass', f, sr, order), x, axis=0)
+def bpf(x, lo, hi, sr=SR, order=2): return ss.sosfilt(ss.butter(order, [lo, hi], 'bandpass', fs=sr, output='sos'), x, axis=0)
+
+
+def peq(x, f0, gain_db, q=1.0, sr=SR):
+    """RBJ peaking EQ."""
+    A = 10 ** (gain_db / 40); w = 2 * np.pi * f0 / sr; al = np.sin(w) / (2 * q)
+    b = [1 + al * A, -2 * np.cos(w), 1 - al * A]; a = [1 + al / A, -2 * np.cos(w), 1 - al / A]
+    return ss.lfilter(np.array(b) / a[0], np.array(a) / a[0], x, axis=0)
+
+
+def shelf(x, f0, gain_db, kind='low', sr=SR, s=1.0):
+    A = 10 ** (gain_db / 40); w = 2 * np.pi * f0 / sr; cw, sw = np.cos(w), np.sin(w)
+    al = sw / 2 * np.sqrt((A + 1 / A) * (1 / s - 1) + 2); sa = 2 * np.sqrt(A) * al
+    if kind == 'low':
+        b = [A * ((A + 1) - (A - 1) * cw + sa), 2 * A * ((A - 1) - (A + 1) * cw), A * ((A + 1) - (A - 1) * cw - sa)]
+        a = [(A + 1) + (A - 1) * cw + sa, -2 * ((A - 1) + (A + 1) * cw), (A + 1) + (A - 1) * cw - sa]
+    else:
+        b = [A * ((A + 1) + (A - 1) * cw + sa), -2 * A * ((A - 1) + (A + 1) * cw), A * ((A + 1) + (A - 1) * cw - sa)]
+        a = [(A + 1) - (A - 1) * cw + sa, 2 * ((A - 1) - (A + 1) * cw), (A + 1) - (A - 1) * cw - sa]
+    return ss.lfilter(np.array(b) / a[0], np.array(a) / a[0], x, axis=0)
+
+
+def sat(x, drive_db=6.0, mix=1.0):
+    """tanh saturation, level-compensated."""
+    g = 10 ** (drive_db / 20); y = np.tanh(x * g) / np.tanh(g)
+    return mix * y + (1 - mix) * x
+
+
+def env_exp(n, tau_s, sr=SR):
+    return np.exp(-np.arange(n) / (tau_s * sr))
+
+
+# ------------------------------------------------------------------ drum synthesis
+def kick_808(f0=48.0, decay=0.9, pitch_drop=2.2, drop_tau=0.035, click=0.25, drive_db=4.0, sr=SR):
+    """TR-808 style bass drum: sine with exponential pitch sweep + click, gently saturated."""
+    n = int((decay * 3 + 0.05) * sr); t = np.arange(n) / sr
+    f = f0 * (1 + (pitch_drop - 1) * np.exp(-t / drop_tau))
+    ph = 2 * np.pi * np.cumsum(f) / sr
+    y = np.sin(ph) * np.exp(-t / decay)
+    ck = np.random.default_rng(1).standard_normal(n) * np.exp(-t / 0.0025)
+    y += click * bpf(ck, 1000, 6000, sr)
+    y = sat(y, drive_db)
+    return (y / np.abs(y).max()).astype(np.float32)
+
+
+def snare_synth(tone=185.0, noise_tau=0.11, tone_tau=0.06, snappy=0.7, sr=SR, seed=2):
+    n = int(0.5 * sr); t = np.arange(n) / sr
+    body = np.sin(2 * np.pi * tone * t) * np.exp(-t / tone_tau) + 0.5 * np.sin(2 * np.pi * tone * 1.6 * t) * np.exp(-t / (tone_tau * .7))
+    nz = np.random.default_rng(seed).standard_normal(n) * np.exp(-t / noise_tau)
+    nz = bpf(nz, 1800, 9000, sr)
+    y = 0.6 * body + snappy * nz / (np.abs(nz).max() + 1e-9)
+    return (y / np.abs(y).max()).astype(np.float32)
+
+
+def hat_synth(open_=False, sr=SR, seed=3):
+    n = int((0.45 if open_ else 0.08) * sr); t = np.arange(n) / sr
+    # 808-style: six square oscillators, band-passed
+    fr = [205.3, 304.4, 369.6, 522.7, 540.0, 800.0]
+    y = sum(np.sign(np.sin(2 * np.pi * f * 2.0 * t + k)) for k, f in enumerate(fr))
+    y = bpf(y, 7000, 14000, sr, 4) + 0.3 * hp(np.random.default_rng(seed).standard_normal(n), 8000, sr)
+    y *= np.exp(-t / (0.12 if open_ else 0.018))
+    return (y / np.abs(y).max()).astype(np.float32)
+
+
+def clap_synth(sr=SR, seed=4):
+    n = int(0.4 * sr); t = np.arange(n) / sr
+    nz = bpf(np.random.default_rng(seed).standard_normal(n), 900, 5000, sr)
+    env = np.zeros(n)
+    for k, d in enumerate((0, 0.011, 0.022, 0.031)):
+        i = int(d * sr); env[i:] += np.exp(-(t[:n - i]) / (0.008 if k < 3 else 0.09))
+    y = nz * env
+    return (y / np.abs(y).max()).astype(np.float32)
+
+
+# ------------------------------------------------------------------ vintage samplers
+def vintage(x, mode='sp1200', sr=SR):
+    """Emulate the converter character of classic hip-hop samplers on a mono/stereo array.
+    sp1200: 26.04 kHz, 12-bit, weak anti-alias (aliasing grit), output low-pass; the boom-bap crunch.
+    mpc60 : 40 kHz, 12-bit companded-ish (16-bit store, 12-bit-like DAC colour), soft top.
+    s950  : 39 kHz/31.25 kHz switchable filter, 12-bit, warm low-pass.
+    """
+    mono = x.ndim == 1
+    X = x[:, None] if mono else x
+    if mode == 'sp1200':
+        fs2, bits, lpf = 26040, 12, 12500
+    elif mode == 'mpc60':
+        fs2, bits, lpf = 40000, 12, 16000
+    elif mode == 's950':
+        fs2, bits, lpf = 31250, 12, 10500
+    else:
+        return x
+    # decimate with a weak (1st-order) pre-filter to keep some aliasing
+    pre = lp(X, fs2 * 0.48, sr, 1)
+    idx = np.arange(0, len(pre), sr / fs2)
+    d = np.stack([np.interp(idx, np.arange(len(pre)), pre[:, c]) for c in range(X.shape[1])], 1)
+    q = 2 ** (bits - 1)
+    peak = np.abs(d).max() + 1e-9
+    d = np.round(d / peak * q * 0.98) / q * peak / 0.98
+    # zero-order-hold back up (imaging) then output filter
+    back = resample_poly(d, sr, fs2, axis=0)
+    back = lp(back, lpf, sr, 4)
+    back = back[:len(X)]
+    if len(back) < len(X): back = np.pad(back, ((0, len(X) - len(back)), (0, 0)))
+    return back[:, 0] if mono else back
+
+
+def pitch_resample(x, semitones):
+    """Sampler-style pitch change (speed and pitch together, like an SP-1200/MPC)."""
+    if abs(semitones) < 1e-3: return x
+    r = 2 ** (semitones / 12)
+    idx = np.arange(0, len(x) - 1, r)
+    if x.ndim == 1: return np.interp(idx, np.arange(len(x)), x).astype(np.float32)
+    return np.stack([np.interp(idx, np.arange(len(x)), x[:, c]) for c in range(x.shape[1])], 1).astype(np.float32)
+
+
+# ------------------------------------------------------------------ dynamics
+def compress(x, thr_db=-18, ratio=4, att_ms=10, rel_ms=120, makeup_db=0, knee_db=6, sidechain=None, sr=SR):
+    """Feed-forward RMS-ish compressor (stereo-linked). sidechain: optional key signal."""
+    key = x if sidechain is None else sidechain
+    k = np.abs(key).max(axis=1) if key.ndim == 2 else np.abs(key)
+    a = np.exp(-1 / (att_ms * 1e-3 * sr)); r = np.exp(-1 / (rel_ms * 1e-3 * sr))
+    env = ss.lfilter([1 - r], [1, -r], k)  # release-shaped smoothing
+    env = np.maximum(env, ss.lfilter([1 - a], [1, -a], k))
+    lvl = 20 * np.log10(env + 1e-9)
+    over = lvl - thr_db
+    gr = np.where(over <= -knee_db / 2, 0, np.where(over >= knee_db / 2, over * (1 - 1 / ratio), (over + knee_db / 2) ** 2 / (2 * knee_db) * (1 - 1 / ratio)))
+    g = 10 ** ((-gr + makeup_db) / 20)
+    return x * (g[:, None] if x.ndim == 2 else g)
+
+
+def soft_clip(x, thr=0.89):
+    y = np.where(np.abs(x) < thr, x, np.sign(x) * (thr + (1 - thr) * np.tanh((np.abs(x) - thr) / (1 - thr))))
+    return y
+
+
+def true_peak_limit(x, ceiling_db=-1.0, lookahead_ms=1.5, rel_ms=60, sr=SR):
+    """4x-oversampled peak detection, lookahead gain computer, delay-compensated."""
+    c = 10 ** (ceiling_db / 20)
+    up = resample_poly(x, 4, 1, axis=0)
+    pk = np.abs(up).max(axis=1).reshape(-1, 4).max(axis=1) if len(up) % 4 == 0 else np.abs(up[:len(up) // 4 * 4]).max(axis=1).reshape(-1, 4).max(axis=1)
+    pk = np.pad(pk, (0, len(x) - len(pk)), mode='edge')
+    need = np.minimum(1, c / (pk + 1e-12))
+    la = int(lookahead_ms * 1e-3 * sr)
+    # min over lookahead window
+    from scipy.ndimage import minimum_filter1d
+    need = minimum_filter1d(need, size=2 * la + 1, origin=0)
+    g = _release(need, np.exp(-1 / (rel_ms * 1e-3 * sr)))
+    return x * g[:, None]
+
+
+try:
+    from numba import njit
+except ImportError:  # pragma: no cover
+    njit = lambda f: f
+
+
+@njit
+def _release(need, r):
+    g = np.empty_like(need); cur = 1.0
+    for i in range(len(need)):
+        cur = need[i] if need[i] < cur else need[i] + (cur - need[i]) * r
+        g[i] = cur
+    return g
+
+
+def lufs(x, sr=SR):
+    import pyloudnorm as pyln
+    return pyln.Meter(sr).integrated_loudness(x)
+
+
+# ------------------------------------------------------------------ texture & synth voices
+def vinyl(n, level_db=-38, crackle_per_s=9, sr=SR, seed=11):
+    """Vinyl bed: band-limited hiss + sparse crackle impulses + slow rumble, stereo."""
+    rng = np.random.default_rng(seed)
+    hiss = bpf(rng.standard_normal((n, 2)), 1500, 9000, sr) * 0.25
+    ck = np.zeros((n, 2))
+    k = rng.poisson(crackle_per_s * n / sr)
+    pos = rng.integers(0, n, k)
+    ck[pos, rng.integers(0, 2, k)] = rng.uniform(-1, 1, k) * rng.pareto(3, k).clip(0, 6)
+    ck = hp(ck, 1200, sr)
+    rumble = lp(rng.standard_normal((n, 2)), 40, sr) * 0.6
+    y = hiss + ck + rumble
+    return (y / (np.abs(y).max() + 1e-9) * 10 ** (level_db / 20)).astype(np.float32)
+
+
+def glide_lead(notes, spb, total_s, glide_s=0.07, vib_hz=5.2, vib_cents=18, sr=SR, bright=0.18):
+    """G-funk whistle lead: one continuous oscillator (sine + a little saw), portamento between notes,
+    delayed vibrato. notes = list of (beat, dur_beats, midi, vel)."""
+    n = int(total_s * sr); f = np.zeros(n); a = np.zeros(n)
+    notes = sorted(notes)
+    prev = None
+    for beat, dur, m, vel in notes:
+        s, e = int(beat * spb * sr), int((beat + dur) * spb * sr)
+        e = min(e, n)
+        tgt = 440 * 2 ** ((m - 69) / 12)
+        if prev is not None and s - prev[1] < int(0.05 * sr):
+            g = min(int(glide_s * sr), e - s)
+            f[s:s + g] = np.geomspace(prev[0], tgt, g); f[s + g:e] = tgt
+        else:
+            f[s:e] = tgt
+        L = e - s; t = np.arange(L) / sr
+        env = np.minimum(1, t / 0.012) * np.minimum(1, (L - np.arange(L)) / (0.06 * sr))
+        a[s:e] = np.maximum(a[s:e], env * vel / 127)
+        vib = np.clip((t - 0.18) / 0.25, 0, 1) * vib_cents / 1200
+        f[s:e] *= 2 ** (vib * np.sin(2 * np.pi * vib_hz * t))
+        prev = (tgt, e)
+    f[f == 0] = 1
+    ph = 2 * np.pi * np.cumsum(f) / sr
+    saw = 2 * ((ph / (2 * np.pi)) % 1) - 1
+    y = (np.sin(ph) * (1 - bright) + bright * lp(saw, 2500, sr)) * a
+    return np.stack([y, y], 1).astype(np.float32)
+
+
+def bass_808(notes, spb, total_s, decay=0.55, drive_db=7, glide_s=0.0, sr=SR):
+    """Tuned 808 bass line: each note = sine with short pitch kick + saturation; notes=(beat,dur,midi,vel)."""
+    n = int(total_s * sr); y = np.zeros(n)
+    for beat, dur, m, vel in sorted(notes):
+        s = int(beat * spb * sr); L = min(int((dur * spb + 0.08) * sr), n - s)
+        if L <= 0: continue
+        t = np.arange(L) / sr; f0 = 440 * 2 ** ((m - 69) / 12)
+        f = f0 * (1 + 1.2 * np.exp(-t / 0.018))
+        x = np.sin(2 * np.pi * np.cumsum(f) / sr) * np.exp(-t / decay) * (vel / 127)
+        x *= np.minimum(1, (L - np.arange(L)) / (0.02 * sr))
+        y[s:s + L] = x + y[s:s + L] * np.exp(-np.arange(L) / (0.004 * sr))  # choke previous note
+    y = sat(y, drive_db)
+    return np.stack([y, y], 1).astype(np.float32)
+
+
+def width(x, w):
+    """Mid/side width: w=1 unchanged, 0 = mono."""
+    m = x.mean(1, keepdims=True); s = (x[:, :1] - x[:, 1:]) / 2
+    return np.concatenate([m + w * s, m - w * s], 1)
+
+=== FILE: scripts/engine/folder_sampler.py ===
+"""Sampler for folders of single-note WAVs named like  spic_A2_v1_RR1.wav / susvib_C#3_v3_1.wav / KSHarp_D4_mf.wav (VSCO-2-CE)."""
+import os, re, glob, random
+import numpy as np, soundfile as sf
+from scipy.signal import resample_poly
+from sfz import note_num
+
+DYN = {'pp': 1, 'p': 2, 'mp': 3, 'mf': 4, 'f': 5, 'ff': 6}
+
+
+class FolderSampler:
+    def __init__(self, folder, sr=48000, release=0.25, gain_db=0.0, name_offset=12):
+        """name_offset: VSCO-2-CE names most files one octave low (measured with pYIN: +12 st); harp folder is correct (0)."""
+        self.sr, self.release, self.gain = sr, release, 10 ** (gain_db / 20)
+        self.map = {}  # note -> {layer: [paths]}
+        for p in glob.glob(os.path.join(folder, '*.wav')):
+            b = os.path.basename(p)
+            m = re.search(r'_([A-Ga-g][#b]?-?\d)(?:_|\.)', b)
+            if not m: continue
+            n = note_num(m.group(1)) + name_offset
+            v = re.search(r'_v(\d+)', b); d = re.search(r'_(pp|p|mp|mf|f|ff)(?:_|\.)', b)
+            layer = int(v.group(1)) if v else DYN.get(d.group(1), 4) if d else 1
+            self.map.setdefault(n, {}).setdefault(layer, []).append(p)
+        self.notes = np.array(sorted(self.map)); self.cache = {}
+        if not len(self.notes): raise ValueError('no samples in ' + folder)
+
+    def _load(self, p):
+        if p not in self.cache:
+            x, sr = sf.read(p, always_2d=True, dtype='float32')
+            if x.shape[1] == 1: x = np.repeat(x, 2, 1)
+            if sr != self.sr: x = resample_poly(x, self.sr, sr, axis=0).astype(np.float32)
+            self.cache[p] = x
+        return self.cache[p]
+
+    def render_note(self, key, vel, dur, rng=None):
+        rng = rng or random
+        src = int(self.notes[np.argmin(np.abs(self.notes - key))])
+        layers = sorted(self.map[src]); li = layers[min(len(layers) - 1, int(vel / 128 * len(layers)))]
+        x = self._load(rng.choice(self.map[src][li]))
+        semis = key - src
+        if semis:
+            r = 2 ** (semis / 12); idx = np.arange(0, len(x) - 1, r)
+            x = np.stack([np.interp(idx, np.arange(len(x)), x[:, c]) for c in range(2)], 1).astype(np.float32)
+        n_on = int(dur * self.sr); n_rel = int(self.release * self.sr)
+        x = x[:n_on + n_rel].copy()
+        if len(x) > n_on:
+            x[n_on:] *= np.exp(-5 * np.arange(len(x) - n_on) / max(1, n_rel))[:, None]
+        return x * self.gain * (0.35 + 0.65 * (vel / 127) ** 1.6)
+
+=== FILE: scripts/engine/jucestate.py ===
+"""Read/write JUCE VST3 plugin state (MemoryBlock base64) so factory patches (.fxp) can be loaded headless via pedalboard."""
+import re
+TABLE = ".ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+"
+IDX = {c: i for i, c in enumerate(TABLE)}
+
+
+def juce_b64_decode(s):
+    size, data = s.split('.', 1)
+    size = int(size); out = bytearray(size); pos = 0
+    for ch in data:
+        v = IDX[ch]
+        for b in range(6):
+            if v >> b & 1:
+                bit = pos + b
+                if bit // 8 < size: out[bit // 8] |= 1 << (bit % 8)
+        pos += 6
+    return bytes(out)
+
+
+def juce_b64_encode(b):
+    nbits = len(b) * 8; chars = []
+    for pos in range(0, nbits, 6):
+        v = 0
+        for k in range(6):
+            bit = pos + k
+            if bit < nbits and b[bit // 8] >> (bit % 8) & 1: v |= 1 << k
+        chars.append(TABLE[v])
+    return f"{len(b)}." + ''.join(chars)
+
+
+def get_component(raw_state):
+    xml = raw_state[8:].decode('utf-8', 'ignore') if raw_state[:4] == b'VC2!' else raw_state.decode('utf-8', 'ignore')
+    m = re.search(r'<IComponent>([^<]+)</IComponent>', xml)
+    return juce_b64_decode(m.group(1).strip())
+
+
+def set_component(raw_state, comp_bytes):
+    head = raw_state[:8]
+    xml = raw_state[8:].decode('utf-8', 'ignore')
+    xml = re.sub(r'<IComponent>[^<]+</IComponent>', '<IComponent>' + juce_b64_encode(comp_bytes) + '</IComponent>', xml)
+    body = xml.encode('utf-8').rstrip(b'\x00')
+    # VC2! header: magic + little-endian uint32 length of the xml payload (payload is NUL-terminated)
+    import struct
+    return b'VC2!' + struct.pack('<I', len(body)) + body + b'\x00'
+
+
+def load_fxp_into(plugin, fxp_path):
+    data = open(fxp_path, 'rb').read()
+    i = data.find(b'sub3')
+    plugin.raw_state = set_component(plugin.raw_state, data[i:])
+    return plugin
+
+=== FILE: scripts/engine/render.py ===
+"""Song model + renderer: tracks of note events -> stems -> mix bus -> master.
+
+A Song is defined in beats. Swing and per-track micro-timing are applied at render time, so the same
+pattern can be rendered straight, MPC-swung, or laid-back without touching the notes.
+"""
+import os, json, random
+import numpy as np, soundfile as sf
+import pedalboard
+from mido import Message
+import dsp
+from dsp import SR
+
+VST = '/usr/lib/vst3/'
+
+
+class Note:
+    __slots__ = ('beat', 'dur', 'pitch', 'vel')
+
+    def __init__(self, beat, dur, pitch, vel=100):
+        self.beat, self.dur, self.pitch, self.vel = beat, dur, pitch, vel
+
+
+class Track:
+    """instrument: ('sfz', SFZ) | ('vst', path, fxp_or_None, params) | ('oneshot', {pitch: array}) | ('func', f(pitch, vel, dur_s)->array)"""
+
+    def __init__(self, name, instrument, notes=None, gain_db=0.0, pan=0.0, timing_ms=0.0, humanize_ms=0.0,
+                 vel_jitter=0, swing=None, fx=None, send_reverb=0.0, mono=False):
+        self.name, self.instrument = name, instrument
+        self.notes = notes or []
+        self.gain_db, self.pan, self.timing_ms, self.humanize_ms = gain_db, pan, timing_ms, humanize_ms
+        self.vel_jitter, self.swing, self.fx, self.send_reverb, self.mono = vel_jitter, swing, fx, send_reverb, mono
+
+
+class Song:
+    def __init__(self, bpm, bars, swing=50.0, seed=7):
+        self.bpm, self.bars, self.swing, self.seed = bpm, bars, swing, seed
+        self.tracks = []
+
+    @property
+    def spb(self):  # seconds per beat
+        return 60.0 / self.bpm
+
+    def beat_to_s(self, beat, swing):
+        """Swing delays every odd 16th; swing in % (50 = straight, 66.7 = triplet)."""
+        six = beat * 4.0
+        i = int(np.floor(six + 1e-6)); frac = six - i
+        delay = 0.0
+        if i % 2 == 1 and frac < 1e-3:
+            delay = (swing - 50.0) / 50.0 * (self.spb / 4)
+        return beat * self.spb + delay
+
+    def length_s(self):
+        return self.bars * 4 * self.spb
+
+
+def _place(buf, x, start):
+    if x is None or start >= len(buf): return
+    if start < 0: x = x[-start:]; start = 0
+    n = min(len(x), len(buf) - start)
+    buf[start:start + n] += x[:n]
+
+
+def render_track(song, tr, tail_s=4.0):
+    rng = random.Random(song.seed + hash(tr.name) % 1000)
+    n = int((song.length_s() + tail_s) * SR)
+    buf = np.zeros((n, 2), np.float32)
+    sw = tr.swing if tr.swing is not None else song.swing
+    kind = tr.instrument[0]
+    if kind in ('sfz', 'oneshot', 'func'):
+        for nt in tr.notes:
+            t = song.beat_to_s(nt.beat, sw) + tr.timing_ms / 1000 + rng.gauss(0, tr.humanize_ms / 1000 if tr.humanize_ms else 0)
+            vel = int(np.clip(nt.vel + (rng.randint(-tr.vel_jitter, tr.vel_jitter) if tr.vel_jitter else 0), 1, 127))
+            dur_s = nt.dur * song.spb
+            if kind == 'sfz':
+                x = tr.instrument[1].render_note(nt.pitch, vel, dur_s, rng)
+            elif kind == 'oneshot':
+                src = tr.instrument[1][nt.pitch]
+                x = src * (vel / 127) ** 1.5
+                if x.ndim == 1: x = np.stack([x, x], 1)
+            else:
+                x = tr.instrument[1](nt.pitch, vel, dur_s)
+                if x.ndim == 1: x = np.stack([x, x], 1)
+            if x is None:
+                tr.missing = getattr(tr, 'missing', 0) + 1; continue
+            _place(buf, x.astype(np.float32), int(t * SR))
+    elif kind == 'vst':
+        _, path, fxp, params = tr.instrument
+        plug = pedalboard.load_plugin(VST + path)
+        if fxp:
+            import jucestate
+            jucestate.load_fxp_into(plug, fxp)
+            plug([], duration=0.5, sample_rate=SR, reset=False)
+        for k, v in (params or {}).items():
+            setattr(plug, k, v)
+        msgs = []
+        for nt in tr.notes:
+            t = song.beat_to_s(nt.beat, sw) + tr.timing_ms / 1000 + rng.gauss(0, tr.humanize_ms / 1000 if tr.humanize_ms else 0)
+            t = max(0.0, t)
+            vel = int(np.clip(nt.vel + (rng.randint(-tr.vel_jitter, tr.vel_jitter) if tr.vel_jitter else 0), 1, 127))
+            msgs.append((t, Message('note_on', note=int(nt.pitch), velocity=vel)))
+            msgs.append((t + nt.dur * song.spb, Message('note_off', note=int(nt.pitch), velocity=0)))
+        msgs.sort(key=lambda m: (m[0], m[1].type == 'note_on'))
+        out = plug([m.copy(time=t) for t, m in msgs], duration=n / SR, sample_rate=SR, reset=False)
+        buf = out.T.astype(np.float32)
+        if buf.shape[1] == 1: buf = np.repeat(buf, 2, 1)
+        buf = buf[:n]
+    if tr.mono:
+        m = buf.mean(1, keepdims=True); buf = np.repeat(m, 2, 1)
+    if tr.fx is not None:
+        buf = tr.fx(buf)
+    # pan (constant power) + gain
+    p = (tr.pan + 1) * np.pi / 4
+    buf = buf * np.array([np.cos(p), np.sin(p)], np.float32) * np.sqrt(2) * 10 ** (tr.gain_db / 20)
+    return buf
+
+
+def plate_reverb(x, room=0.35, damp=0.6, wet=1.0):
+    board = pedalboard.Pedalboard([pedalboard.Reverb(room_size=room, damping=damp, wet_level=wet, dry_level=0.0, width=0.9)])
+    return board(x.T, SR).T
+
+
+def mixdown(song, stems, reverb=None, bus=None, master=None, reverb_width=0.6):
+    n = max(len(s) for s in stems.values())
+    mix = np.zeros((n, 2), np.float32); send = np.zeros((n, 2), np.float32)
+    for tr in song.tracks:
+        s = stems[tr.name]
+        mix[:len(s)] += s
+        if tr.send_reverb > 0: send[:len(s)] += s * tr.send_reverb
+    if send.any():
+        rv = (reverb or plate_reverb)(send)
+        rv = dsp.hp(rv, 250)  # keep the low end dry and mono-safe
+        m_, s_ = rv.mean(1, keepdims=True), (rv[:, :1] - rv[:, 1:]) / 2
+        rv = np.concatenate([m_ + reverb_width * s_, m_ - reverb_width * s_], 1)  # refs are narrow (median side-mid -19 dB)
+        mix[:len(rv)] += rv
+    if bus: mix = bus(mix)
+    if master: mix = master(mix)
+    return mix
+
+
+def master_chain(x, target_lufs=-9.5, ceiling_db=-1.0, glue=True):
+    y = x.copy()
+    if glue:
+        y = dsp.compress(y, thr_db=-14, ratio=2, att_ms=30, rel_ms=150, knee_db=6)
+    # loudness: gain into soft clip + true-peak limiter, iterate to target
+    g = 0.0
+    for _ in range(6):
+        z = dsp.true_peak_limit(dsp.soft_clip(y * 10 ** (g / 20)), ceiling_db)
+        l = dsp.lufs(z)
+        if abs(l - target_lufs) < 0.15: break
+        g += (target_lufs - l)
+    return z
+
+
+def export(path_noext, x, mp3=True):
+    os.makedirs(os.path.dirname(path_noext), exist_ok=True)
+    sf.write(path_noext + '.wav', x, SR, subtype='PCM_24')
+    if mp3:
+        os.system(f'ffmpeg -v error -y -i "{path_noext}.wav" -b:a 320k "{path_noext}.mp3"')
+
+
+def auto_balance(stems, targets_lu, ref='snare'):
+    """Gain-stage stems by measured loudness: targets_lu = {stem: LU relative to the reference stem}.
+    Loudness = BS.1770 integrated (gated, so silence/rests don't count). Returns new dict + applied gains."""
+    import pyloudnorm as pyln
+    meter = pyln.Meter(SR)
+    L = {k: meter.integrated_loudness(v) for k, v in stems.items() if np.abs(v).max() > 1e-5}
+    base = L[ref]
+    out, gains = {}, {}
+    for k, v in stems.items():
+        if k in targets_lu and k in L and np.isfinite(L[k]):
+            g = base + targets_lu[k] - L[k]; out[k] = v * 10 ** (g / 20); gains[k] = round(g, 1)
+        else:
+            out[k] = v
+    return out, gains
+
+=== FILE: scripts/engine/sfz.py ===
+"""Minimal, dependency-light SFZ sampler (enough of SFZ v1/v2 for the sfzinstruments/Karoryfer libraries).
+
+Supports: #define, #include, <control> default_path / set_cc, header inheritance (global > master > group > region),
+key/lokey/hikey/pitch_keycenter, lovel/hivel, tune/transpose/pitch_keytrack, volume/amplitude/pan, offset,
+seq_length/seq_position (round robin), lorand/hirand, trigger (attack only), sw_last/sw_default keyswitches,
+locc/hicc conditions evaluated against set_cc defaults (+ overrides), loop_mode one_shot, ampeg_attack/release.
+Not supported (ignored): CC modulation curves, filters, LFOs, crossfades, release triggers.
+"""
+import os, re, random
+import numpy as np, soundfile as sf
+from scipy.signal import resample_poly
+
+NOTE_NAMES = {'c': 0, 'd': 2, 'e': 4, 'f': 5, 'g': 7, 'a': 9, 'b': 11}
+
+
+def note_num(v):
+    v = str(v).strip()
+    try:
+        return int(v)
+    except ValueError:
+        m = re.match(r'([a-gA-G])([#b]?)(-?\d+)', v)
+        if not m: return None
+        n = NOTE_NAMES[m.group(1).lower()] + (1 if m.group(2) == '#' else -1 if m.group(2) == 'b' else 0)
+        return n + (int(m.group(3)) + 1) * 12
+
+
+class SFZ:
+    def __init__(self, path, cc=None, sr=48000, key_offset=0):
+        """key_offset: measured correction so that render_note(k) SOUNDS at MIDI k (Growlybass: +12, measured with pYIN)."""
+        self.key_offset = key_offset
+        self.path = path; self.root = os.path.dirname(path); self.sr = sr
+        self.defines = {}; self.cc = {}; self.default_path = ''
+        self.regions = []; self.cache = {}; self.rr = {}
+        text = self._load(path)
+        self._parse(text)
+        if cc: self.cc.update(cc)
+        self.sw_default = None
+        for r in self.regions:
+            if 'sw_default' in r: self.sw_default = note_num(r['sw_default'])
+
+    def _load(self, path, depth=0):
+        txt = open(path, encoding='utf-8', errors='ignore').read()
+        txt = re.sub(r'/\*.*?\*/', '', txt, flags=re.S)
+        txt = re.sub(r'//[^\n]*', '', txt)
+        def inc(m):
+            p2 = os.path.join(self.root, m.group(1))
+            return '\n' + self._load(p2, depth + 1) + '\n' if depth < 12 and os.path.exists(p2) else ''
+        txt = re.sub(r'#include\s+"([^"]+)"', inc, txt)
+        def dfn(m):
+            self.defines[m.group(1)] = m.group(2); return ''
+        txt = re.sub(r'#define\s+(\$\w+)\s+(\S+)', dfn, txt)
+        return txt
+
+    def _sub(self, s):
+        for k in sorted(self.defines, key=len, reverse=True): s = s.replace(k, self.defines[k])
+        return s
+
+    def _parse(self, text):
+        text = self._sub(text)
+        tokens = re.split(r'(<\w+>)', text)
+        level = {'global': {}, 'master': {}, 'group': {}}
+        cur = None; cur_hdr = None
+        def opcodes(s):
+            # values may contain spaces (sample paths): split at ' key=' boundaries
+            res = {}
+            for m in re.finditer(r'(\w+)=(.*?)(?=\s+\w+=|$)', s.strip().replace('\n', ' ')):
+                res[m.group(1)] = m.group(2).strip()
+            return res
+        for tok in tokens:
+            if not tok.strip(): continue
+            if re.match(r'<\w+>', tok):
+                cur_hdr = tok[1:-1]
+                if cur_hdr == 'global': level = {'global': {}, 'master': {}, 'group': {}}
+                elif cur_hdr == 'master': level['master'] = {}; level['group'] = {}
+                elif cur_hdr == 'group': level['group'] = {}
+                continue
+            ops = opcodes(tok)
+            if cur_hdr == 'control':
+                if 'default_path' in ops: self.default_path = ops['default_path'].replace('\\', '/')
+                for k, v in ops.items():
+                    m = re.match(r'set_(?:hd)?cc(\d+)', k)
+                    if m:
+                        val = float(v); self.cc[int(m.group(1))] = val * 127 if 'hdcc' in k else val
+            elif cur_hdr in ('global', 'master', 'group'):
+                level[cur_hdr].update(ops)
+            elif cur_hdr == 'region':
+                r = {}; r.update(level['global']); r.update(level['master']); r.update(level['group']); r.update(ops)
+                if 'sample' in r and not r['sample'].startswith('*'):
+                    r['_sample'] = os.path.normpath(os.path.join(self.root, self.default_path, r['sample'].replace('\\', '/')))
+                    self.regions.append(r)
+
+    # ------------------------------------------------------------------
+    def _ok(self, r, key, vel):
+        lk = note_num(r.get('lokey', r.get('key', 0))); hk = note_num(r.get('hikey', r.get('key', 127)))
+        if lk is None or hk is None or not (lk <= key <= hk): return False
+        if not (int(r.get('lovel', 1)) <= vel <= int(r.get('hivel', 127))): return False
+        if r.get('trigger', 'attack') not in ('attack', 'first'): return False
+        if 'sw_last' in r and self.sw_default is not None and note_num(r['sw_last']) != self.sw_default: return False
+        for k, v in r.items():
+            m = re.match(r'locc(\d+)$', k)
+            if m and self.cc.get(int(m.group(1)), 0) < float(v): return False
+            m = re.match(r'hicc(\d+)$', k)
+            if m and self.cc.get(int(m.group(1)), 0) > float(v): return False
+        return True
+
+    def _sample(self, p):
+        if p not in self.cache:
+            if not os.path.exists(p):
+                alt = [os.path.splitext(p)[0] + e for e in ('.flac', '.wav', '.ogg')]
+                p2 = next((a for a in alt if os.path.exists(a)), None)
+                if p2 is None: raise FileNotFoundError(p)
+            else:
+                p2 = p
+            x, sr = sf.read(p2, always_2d=True, dtype='float32')
+            if x.shape[1] == 1: x = np.repeat(x, 2, 1)
+            if sr != self.sr: x = resample_poly(x, self.sr, sr, axis=0).astype(np.float32)
+            self.cache[p] = x
+        return self.cache[p]
+
+    def render_note(self, key, vel, dur, rng=None):
+        """Return stereo float32 array for one note (dur in seconds of note-on; release appended)."""
+        rng = rng or random
+        key = key + self.key_offset
+        cands = [r for r in self.regions if self._ok(r, key, vel)]
+        if not cands: return None
+        # round robin groups
+        if any('seq_length' in r for r in cands):
+            slen = int(cands[0].get('seq_length', 1)); pos = self.rr.get((key, vel // 16), 0) % slen + 1
+            self.rr[(key, vel // 16)] = pos
+            c2 = [r for r in cands if int(r.get('seq_position', 1)) == pos]; cands = c2 or cands
+        rv = rng.random()
+        c2 = [r for r in cands if float(r.get('lorand', 0)) <= rv < float(r.get('hirand', 1.0001))]
+        cands = c2 or cands
+        out = None
+        for r in cands:
+            x = self._sample(r['_sample'])
+            off = int(float(r.get('offset', 0)) * self.sr / 44100)
+            x = x[off:]
+            kc = note_num(r.get('pitch_keycenter', r.get('key', key))) or key
+            kt = float(r.get('pitch_keytrack', 100)) / 100
+            semis = (key - kc) * kt + float(r.get('transpose', 0)) + float(r.get('tune', 0)) / 100
+            if abs(semis) > 1e-3:
+                ratio = 2 ** (semis / 12)
+                n = int(len(x) / ratio)
+                idx = np.arange(n) * ratio
+                x = np.stack([np.interp(idx, np.arange(len(x)), x[:, c]) for c in range(2)], 1).astype(np.float32)
+            g = 10 ** (float(r.get('volume', 0)) / 20) * float(r.get('amplitude', 100)) / 100
+            vt = float(r.get('amp_veltrack', 100)) / 100
+            g *= (1 - vt) + vt * (vel / 127) ** 2
+            pan = float(r.get('pan', 0)) / 100
+            x = x * g * np.array([min(1, 1 - pan), min(1, 1 + pan)], dtype=np.float32)
+            one_shot = r.get('loop_mode', '') == 'one_shot'
+            if not one_shot:
+                rel = float(r.get('ampeg_release', 0.25))
+                n_on = int(dur * self.sr); n_rel = int(rel * self.sr)
+                x = x[:n_on + n_rel].copy()
+                if len(x) > n_on:
+                    env = np.ones(len(x), dtype=np.float32)
+                    tail = len(x) - n_on
+                    env[n_on:] = np.exp(-5 * np.arange(tail) / max(1, n_rel))
+                    x *= env[:, None]
+            att = float(r.get('ampeg_attack', 0))
+            if att > 0.0005:
+                na = min(len(x), int(att * self.sr)); x[:na] *= np.linspace(0, 1, na)[:, None]
+            out = x if out is None else _mix(out, x)
+        return out
+
+
+def _mix(a, b):
+    n = max(len(a), len(b)); o = np.zeros((n, 2), np.float32); o[:len(a)] += a; o[:len(b)] += b; return o
+
+=== FILE: scripts/engine/theory.py ===
+"""Pitch helpers."""
+NAMES = {'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4, 'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11}
+
+
+def n(s):
+    """'C4' -> 60, 'Gb3' -> 54"""
+    name = s[:-1] if s[-1].isdigit() and not s[-2].isdigit() else s[:-2]
+    octv = int(s[len(name):])
+    return NAMES[name] + (octv + 1) * 12
+
+
+def chord(root, quality):
+    iv = {'maj': [0, 4, 7], 'min': [0, 3, 7], 'm7': [0, 3, 7, 10], 'maj7': [0, 4, 7, 11], '7': [0, 4, 7, 10], '9': [0, 4, 7, 10, 14],
+          'm9': [0, 3, 7, 10, 14], 'dim7': [0, 3, 6, 9], 'm7b5': [0, 3, 6, 10], '5': [0, 7, 12], 'sus2': [0, 2, 7], 'mmaj7': [0, 3, 7, 11],
+          '7b9': [0, 4, 7, 10, 13], 'm11': [0, 3, 7, 10, 14, 17]}[quality]
+    r = n(root) if isinstance(root, str) else root
+    return [r + i for i in iv]
+
+=== FILE: projects/prototype_01/concepts.py ===
+"""Prototype 01 — three original 8-bar concepts (Phase 9 step 1).
+
+A  "SUNSET GHOST"   West Coast / G-funk   93 BPM, A dorian (Am9 <-> D9), light swing, whistle lead answers in bars 4 & 8
+B  "GLASS JAW"      G-Unit street-club     90 BPM, F phrygian (b2 menace), staccato octave piano + cello, 808 bass, bounce swing
+C  "CONCRETE PSALM" dark NY boom-bap       87 BPM, C minor jazz dissonance rendered as a fake 'record', SP-1200 drums, heavy late hats
+
+All motifs are written here from scratch (no reference melody, riff or sample). Run: python3 -I projects/prototype_01/concepts.py [A B C]
+"""
+import sys, os, json
+sys.path.insert(0, 'scripts/engine')
+import numpy as np, pedalboard as pb
+import dsp
+from dsp import SR
+from render import Song, Track, Note, render_track, mixdown, master_chain, export, auto_balance
+from sfz import SFZ
+from folder_sampler import FolderSampler
+from theory import n, chord
+
+LIB = 'sound_library/incoming/'
+OUT = 'projects/prototype_01/renders/'
+SURGE = '/usr/share/surge-xt/patches_factory/'
+
+_cache = {}
+
+
+def kit(name):
+    if name not in _cache:
+        _cache[name] = {'virt': lambda: SFZ(LIB + 'virtuosity_drums/Programs/01-basic-kit.sfz'),
+                        'virt_vint': lambda: SFZ(LIB + 'virtuosity_drums/Programs/08-vintage-mic.sfz'),
+                        'rusty': lambda: SFZ(LIB + 'karoryfer.big-rusty-drums/Programs/02-basic.sfz'),
+                        'piano': lambda: SFZ(LIB + 'SalamanderGrandPiano/Salamander Grand Piano V3.sfz'),
+                        'upright': lambda: SFZ(LIB + 'karoryfer.meatbass/Programs/pizz_three.sfz'),
+                        'cello_spic': lambda: FolderSampler(LIB + 'VSCO-2-CE/Strings/Cello Section/spic', release=0.15),
+                        'vln_sus': lambda: FolderSampler(LIB + 'VSCO-2-CE/Strings/Violin Section/susVib', release=0.6),
+                        'growly': lambda: SFZ(LIB + 'karoryfer.growlybass/growlybass_clean.sfz', key_offset=12),
+                        }[name]()
+    return _cache[name]
+
+
+def board(*plugins):
+    b = pb.Pedalboard(list(plugins))
+    return lambda x: b(x.T.astype(np.float32), SR).T
+
+
+def oneshots_from_sfz(sfz, keys_vel):
+    return {k: sfz.render_note(k, v, 0.5) for k, v in keys_vel.items()}
+
+
+# ---------------------------------------------------------------------------------------------- A
+def concept_A(bars=8):
+    bpm = 93.0; s = Song(bpm, bars, swing=58)
+    spb = s.spb
+    # drums: tight sampled kick layered with short 808 body, snare + clap, swung hats
+    vk = kit('virt')
+    kick = vk.render_note(36, 120, 0.3)
+    k808 = dsp.kick_808(f0=52, decay=0.22, pitch_drop=2.5, click=0.15, drive_db=6)
+    n_ = max(len(kick), len(k808)); kk = np.zeros((n_, 2), np.float32); kk[:len(kick)] += kick * 0.8; kk[:len(k808)] += np.stack([k808, k808], 1) * 0.7
+    sn = vk.render_note(38, 118, 0.3); cl = dsp.clap_synth(); sc = np.zeros((max(len(sn), len(cl)), 2), np.float32)
+    sc[:len(sn)] += sn; sc[:len(cl)] += np.stack([cl, cl], 1) * 0.55
+    shots = {36: kk, 38: sc, 42: vk.render_note(42, 90, 0.1), 46: vk.render_note(46, 85, 0.3)}
+    K, S, H, O = [], [], [], []
+    for b in range(bars):
+        o = b * 4
+        K += [Note(o + x, .25, 36, 118) for x in ((0, 1.75, 2.5) if b % 2 == 0 else (0, 0.5, 2.5, 3.25))]
+        S += [Note(o + 1, .25, 38, 120), Note(o + 3, .25, 38, 122)]
+        H += [Note(o + i * .5, .25, 42, 96 if i % 2 == 0 else 74) for i in range(8) if not (b % 4 == 3 and i == 7)]
+        if b % 4 == 3: O.append(Note(o + 3.5, .5, 46, 92))
+    drum_fx = board(pb.HighpassFilter(35), pb.Compressor(threshold_db=-14, ratio=3, attack_ms=8, release_ms=90))
+    s.tracks += [Track('kick', ('oneshot', shots), K, gain_db=-3, mono=True),
+                 Track('snare', ('oneshot', shots), S, gain_db=-5, timing_ms=10, fx=drum_fx, send_reverb=0.08),
+                 Track('hats', ('oneshot', shots), H + O, gain_db=-14, humanize_ms=3, vel_jitter=8, pan=0.15)]
+    # Rhodes-style comping (Surge 'EP 1'): Am9 bar 1, D9 bar 2  (dorian i - IV)
+    am9 = [n('G3'), n('C4'), n('E4'), n('B4')]; d9 = [n('F#3'), n('C4'), n('E4'), n('A4')]
+    comp = []
+    for b in range(bars):
+        o = b * 4; v = am9 if b % 2 == 0 else d9
+        for st, du, ve in ((0, 1.4, 78), (1.75, .5, 70), (2.5, 1.3, 74)):
+            comp += [Note(o + st, du, p, ve) for p in v]
+    s.tracks.append(Track('keys', ('vst', 'Surge XT.vst3', SURGE + 'Keys/EP 1.fxp', None), comp, gain_db=-9, swing=54,
+                          fx=board(pb.HighpassFilter(180), pb.Chorus(rate_hz=0.6, depth=0.15, mix=0.3)), send_reverb=0.18))
+    # funk bass (Growlybass clean), roots + chromatic approach
+    bl = []
+    for b in range(bars):
+        o = b * 4
+        if b % 2 == 0:
+            bl += [Note(o, .7, n('A1'), 112), Note(o + 1.75, .25, n('A1'), 96), Note(o + 2.5, .4, n('C2'), 104), Note(o + 3, .45, n('E2'), 100), Note(o + 3.5, .4, n('C#2'), 96)]
+        else:
+            bl += [Note(o, .7, n('D2'), 112), Note(o + 1.5, .25, n('D2'), 92), Note(o + 2, .5, n('F#2'), 102), Note(o + 2.75, .5, n('A2'), 98), Note(o + 3.5, .4, n('G#1'), 96)]
+    s.tracks.append(Track('bass', ('sfz', kit('growly')), bl, gain_db=-4, swing=56, mono=True,
+                          fx=board(pb.LowpassFilter(1800), pb.Compressor(threshold_db=-16, ratio=4, attack_ms=5, release_ms=80))))
+    # whistle lead answers in bars 4 and 8 only (the vocal keeps bars 1-3)
+    lead = []
+    for b in (3, 7):
+        o = b * 4
+        lead += [(o + 0.5, .5, n('E5'), 90), (o + 1, .75, n('G5'), 100), (o + 1.75, 1.25, n('A5'), 104), (o + 3, .5, n('G5'), 92), (o + 3.5, .5, n('E5'), 84)]
+    s.tracks.append(Track('lead', ('func', None), [], gain_db=-17, pan=-0.1, send_reverb=0.25))
+    s.extra = {'lead': dsp.glide_lead(lead, spb, s.length_s() + 4)}
+    s.balance = {'kick': 0.5, 'snare': 0, 'hats': -9, 'keys': -4, 'bass': -3, 'lead': -6}
+    return s
+
+
+# ---------------------------------------------------------------------------------------------- B
+def concept_B(bars=8):
+    bpm = 90.0; s = Song(bpm, bars, swing=63)
+    spb = s.spb
+    vk = kit('virt')
+    k808 = dsp.kick_808(f0=46, decay=0.3, pitch_drop=3.0, click=0.35, drive_db=8)
+    sn = vk.render_note(40, 125, 0.3)  # rimshot snare: harder crack
+    cl = dsp.clap_synth(seed=9); sc = np.zeros((max(len(sn), len(cl)), 2), np.float32); sc[:len(sn)] += sn; sc[:len(cl)] += np.stack([cl, cl], 1) * 0.8
+    hat = dsp.hat_synth(); ohat = dsp.hat_synth(open_=True)
+    shots = {36: np.stack([k808, k808], 1), 38: sc, 42: np.stack([hat, hat], 1), 46: np.stack([ohat, ohat], 1)}
+    K, S, H = [], [], []
+    for b in range(bars):
+        o = b * 4
+        K += [Note(o + x, .25, 36, 120) for x in (0, 0.75, 2.5)] + ([Note(o + 3.75, .25, 36, 100)] if b % 2 else [])
+        S += [Note(o + 1, .25, 38, 124), Note(o + 3, .25, 38, 124)]
+        if b % 4 == 3:  # hat roll into the next phrase
+            H += [Note(o + i * .5, .25, 42, 92) for i in range(6)] + [Note(o + 3 + i * .125, .125, 42, 70 + 6 * i) for i in range(8)]
+        else:
+            H += [Note(o + i * .5, .25, 42, 100 if i % 2 == 0 else 78) for i in range(8)]
+    s.tracks += [Track('kick', ('oneshot', shots), K, gain_db=-2, mono=True),
+                 Track('snare', ('oneshot', shots), S, gain_db=-6, timing_ms=6,
+                       fx=board(pb.HighpassFilter(120), pb.Compressor(threshold_db=-12, ratio=4, attack_ms=3, release_ms=70)), send_reverb=0.06),
+                 Track('hats', ('oneshot', shots), H, gain_db=-17, humanize_ms=2, vel_jitter=6, pan=-0.12)]
+    # staccato octave piano motif, F phrygian, 2-bar sentence with a rest on beat 4 of bar 1 and a 'question' at the end of bar 2
+    m1 = [(0, .22, 'F3', 112), (0.75, .22, 'F3', 96), (1.5, .3, 'Ab3', 108), (2.0, .45, 'Gb3', 116), (2.75, .22, 'F3', 100)]
+    m2 = [(0, .22, 'C3', 112), (0.75, .22, 'Db3', 104), (1.5, .3, 'C3', 100), (2.5, .22, 'Eb3', 108), (3.0, .5, 'Db3', 112)]
+    pn, ce = [], []
+    for b in range(bars):
+        o = b * 4
+        for st, du, nm, ve in (m1 if b % 2 == 0 else m2):
+            pn += [Note(o + st, du, n(nm), ve), Note(o + st, du, n(nm) + 12, ve - 14)]
+            ce.append(Note(o + st, du + .1, n(nm) - 12, ve - 8))
+    s.tracks.append(Track('piano', ('sfz', kit('piano')), pn, gain_db=-7, swing=50,
+                          fx=board(pb.HighpassFilter(150), pb.Compressor(threshold_db=-18, ratio=3, attack_ms=2, release_ms=60)), send_reverb=0.12))
+    s.tracks.append(Track('cello', ('sfz' if False else 'func', None), [], gain_db=-10))
+    s.extra = {}
+    cs = kit('cello_spic'); buf = np.zeros((int((s.length_s() + 4) * SR), 2), np.float32)
+    for nt in ce:
+        x = cs.render_note(nt.pitch, nt.vel, nt.dur * spb); st = int(s.beat_to_s(nt.beat, 50) * SR); buf[st:st + len(x)] += x[:len(buf) - st]
+    s.extra['cello'] = dsp.hp(buf, 70)
+    # violin pedal (tension) bars 5-8: Gb5 -> F5
+    vs = kit('vln_sus'); vb = np.zeros_like(buf)
+    for b, nm in ((4, 'Gb5'), (6, 'F5')):
+        x = vs.render_note(n(nm), 70, 2 * 4 * spb); st = int(b * 4 * spb * SR); vb[st:st + len(x)] += x[:len(vb) - st]
+    s.extra['strings'] = vb * 0.6
+    s.tracks.append(Track('strings', ('func', None), [], gain_db=-14, send_reverb=0.3))
+    # 808 bass follows the motif roots, leaves beat 4 of bar 1 empty
+    bl = []
+    for b in range(bars):
+        o = b * 4
+        if b % 2 == 0: bl += [(o, .7, n('F1'), 118), (o + .75, .6, n('F1'), 100), (o + 2.5, 1.0, n('F1'), 110)]
+        else: bl += [(o, .7, n('C1') + 12, 116), (o + .75, .6, n('Db1') + 12, 104), (o + 2.5, .5, n('Eb1') + 12, 106), (o + 3.0, .9, n('Db1') + 12, 110)]
+    s.extra['bass'] = dsp.bass_808(bl, spb, s.length_s() + 4, decay=0.45)
+    s.tracks.append(Track('bass', ('func', None), [], gain_db=-5, mono=True))
+    s.balance = {'kick': 0.5, 'snare': 0, 'hats': -9, 'piano': -2, 'cello': -9, 'strings': -10, 'bass': -2.5}
+    return s
+
+
+# ---------------------------------------------------------------------------------------------- C
+def concept_C(bars=8):
+    bpm = 87.0; s = Song(bpm, bars, swing=70)
+    spb = s.spb
+    # 1) compose the 'record' we will sample: 2-bar jazz phrase, piano + upright + muted horn line (sax), C minor
+    rec_song = Song(bpm, 2, swing=55)
+    v1 = [n('Eb3'), n('G3'), n('B3'), n('D4')]         # Cm(maj7)9 (no root; bass plays C)
+    v2 = [n('Gb3'), n('Bb3'), n('C4'), n('Eb4')]       # Abmaj7#11-ish over Ab bass
+    v3 = [n('F3'), n('Ab3'), n('B3'), n('Db4')]        # G7b9 (rootless)
+    pn = [Note(0, 1.6, p, 72) for p in v1] + [Note(1.75, .35, p, 66) for p in v1] + [Note(2.5, 1.4, p, 70) for p in v2] \
+        + [Note(4, 1.0, p, 74) for p in v3] + [Note(5.5, .3, p, 64) for p in v3] + [Note(6.0, 1.9, p, 68) for p in v1]
+    up = [Note(0, .9, n('C2'), 100), Note(1, .9, n('G1'), 92), Note(2.5, .9, n('Ab1'), 98), Note(3.5, .4, n('A1'), 84),
+          Note(4, .9, n('G1'), 100), Note(5, .9, n('B1'), 90), Note(6, .9, n('C2'), 98), Note(7, .9, n('G1'), 88)]
+    rec_song.tracks = [Track('p', ('sfz', kit('piano')), pn, gain_db=-4, humanize_ms=8, vel_jitter=6, send_reverb=0.25),
+                       Track('u', ('sfz', kit('upright')), up, gain_db=-3, humanize_ms=6)]
+    stems = {t.name: render_track(rec_song, t, tail_s=1.0) for t in rec_song.tracks}
+    rec = mixdown(rec_song, stems)
+    rec = rec[:int(rec_song.length_s() * SR)]
+    # 'press the record': tape, band-limit, vinyl, then sample it into an SP-1200
+    tape = pb.load_plugin('/usr/lib/vst3/CHOWTapeModel.vst3')
+    rec = tape(rec.T.astype(np.float32), SR).T
+    rec = dsp.bpf(rec, 90, 7000, order=2) + dsp.vinyl(len(rec), level_db=-34)
+    rec = dsp.vintage(rec / (np.abs(rec).max() + 1e-9) * 0.8, 'sp1200')
+    # 2) chop it: bar A = phrase bar 1 ; bar B = phrase bar 2 but with beat-3 stab repeated (the 'answer')
+    L = int(4 * spb * SR); A, B = rec[:L], rec[L:2 * L].copy()
+    beat = int(spb * SR); stab = rec[int(1.75 * spb * SR):int(1.75 * spb * SR) + beat // 2]
+    B[2 * beat:2 * beat + len(stab)] = stab * np.hanning(len(stab))[:, None] ** 0.1
+    B[int(2.75 * beat):int(2.75 * beat) + len(stab)] = stab[:len(B) - int(2.75 * beat)] * 0.9
+    loop = np.concatenate([A, B]); full = np.concatenate([loop] * (bars // 2) + [np.zeros((int(4 * SR), 2))])
+    M_, S_ = full.mean(1, keepdims=True), (full[:, :1] - full[:, 1:]) / 2
+    full = np.concatenate([M_ + 0.25 * S_, M_ - 0.25 * S_], 1)   # 90s NY = near-mono (refs side-mid -24..-72 dB)
+    full = dsp.hp(full, 110)                                       # the sub owns the bottom, not the sample
+    s.extra = {'sample': full.astype(np.float32)}
+    s.tracks.append(Track('sample', ('func', None), [], gain_db=-6, fx=None))
+    # 3) drums: vintage-mic kit through SP-1200 + crush comp; busy chopped kick, hard snare, very late hats
+    vk = kit('virt_vint')
+    shots = {k: dsp.vintage(vk.render_note(k, v, 0.4) if vk.render_note(k, v, 0.4) is not None else kit('virt').render_note(k, v, 0.4), 'sp1200') for k, v in ((36, 125), (38, 124), (42, 88), (46, 80), (37, 90))}
+    shots[36] = dsp.peq(shots[36], 60, 6, 0.9); shots[36] = dsp.sat(shots[36], 6)
+    K, S, H = [], [], []
+    for b in range(bars):
+        o = b * 4
+        K += [Note(o + x, .25, 36, 120) for x in ((0, 0.75, 1.75, 2.5) if b % 2 == 0 else (0, 1.5, 2.25, 2.5, 3.75))]
+        S += [Note(o + 1, .25, 38, 124), Note(o + 3, .25, 38, 126)] + ([Note(o + 3.75, .25, 37, 70)] if b % 4 == 3 else [])
+        H += [Note(o + i * .5, .25, 42, 92 if i % 2 == 0 else 64) for i in range(8)]
+    crush = board(pb.Compressor(threshold_db=-20, ratio=6, attack_ms=10, release_ms=60), pb.Gain(4))
+    s.tracks += [Track('kick', ('oneshot', shots), K, gain_db=-3, mono=True),
+                 Track('snare', ('oneshot', shots), S, gain_db=-5, timing_ms=14, fx=crush, send_reverb=0.05),
+                 Track('hats', ('oneshot', shots), H, gain_db=-15, humanize_ms=4, vel_jitter=6)]
+    # sub under the sample (sample bass is thin after band-limiting)
+    bl = []
+    for b in range(bars):
+        o = b * 4
+        bl += [(o, 1.5, n('C1') + 12, 110), (o + 2.5, 1.2, n('Ab1') if b % 2 == 0 else n('G1'), 104)]
+    s.extra['bass'] = dsp.bass_808(bl, spb, s.length_s() + 4, decay=0.7, drive_db=3)
+    s.tracks.append(Track('bass', ('func', None), [], gain_db=-9, mono=True))
+    s.balance = {'kick': 1.0, 'snare': 0, 'hats': -10, 'sample': -2.5, 'bass': -1.5}
+    return s
+
+
+def render(song, tag):
+    stems = {}
+    for tr in song.tracks:
+        if tr.instrument[0] == 'func' and tr.name in getattr(song, 'extra', {}):
+            x = song.extra[tr.name]
+            if tr.fx: x = tr.fx(x)
+            p = (tr.pan + 1) * np.pi / 4
+            stems[tr.name] = (x * np.array([np.cos(p), np.sin(p)]) * np.sqrt(2) * 10 ** (tr.gain_db / 20)).astype(np.float32)
+            song._sends = getattr(song, '_sends', {})
+        else:
+            stems[tr.name] = render_track(song, tr)
+    n_ = int((song.length_s() + 2) * SR)
+    for k in stems:
+        s = stems[k][:n_]
+        stems[k] = np.pad(s, ((0, n_ - len(s)), (0, 0)))
+    if getattr(song, 'balance', None):
+        stems, gains = auto_balance(stems, song.balance)
+        print(tag, 'auto-balance gains dB:', gains)
+    mix = mixdown(song, stems)
+    m = master_chain(mix, target_lufs=-10.0)
+    export(OUT + tag, m)
+    for k, v in stems.items():
+        export(OUT + f'{tag}_stems/{k}', v, mp3=False)
+    return m, stems
+
+
+def metrics(x):
+    mono = x.mean(1); spec = np.abs(np.fft.rfft(mono)) ** 2; f = np.fft.rfftfreq(len(mono), 1 / SR)
+    M, S = (x[:, 0] + x[:, 1]) / 2, (x[:, 0] - x[:, 1]) / 2
+    return dict(lufs=round(dsp.lufs(x), 2), true_peak_dbtp=round(20 * np.log10(np.abs(dsp.resample_poly(x, 4, 1, axis=0)).max()), 2),
+                crest_db=round(20 * np.log10(np.abs(mono).max() / np.sqrt(np.mean(mono ** 2))), 2),
+                low_le150_pct=round(100 * spec[f <= 150].sum() / spec.sum(), 1), mid_250_2k_pct=round(100 * spec[(f > 250) & (f < 2000)].sum() / spec.sum(), 1),
+                centroid_hz=round(float((spec * f).sum() / spec.sum()), 0), side_minus_mid_db=round(10 * np.log10(np.mean(S ** 2) / np.mean(M ** 2) + 1e-12), 1),
+                lr_correlation=round(float(np.corrcoef(x[:, 0], x[:, 1])[0, 1]), 3))
+
+
+if __name__ == '__main__':
+    which = sys.argv[1:] or ['A', 'B', 'C']
+    res = {}
+    for w in which:
+        song = {'A': concept_A, 'B': concept_B, 'C': concept_C}[w]()
+        m, _ = render(song, f'concept_{w}')
+        res[w] = metrics(m); print(w, res[w], flush=True)
+    old = json.load(open(OUT + 'metrics.json')) if os.path.exists(OUT + 'metrics.json') else {}
+    old.update(res); json.dump(old, open(OUT + 'metrics.json', 'w'), indent=1)
+
+=== FILE: projects/prototype_01/glass_jaw.py ===
+"""GLASS JAW — full arrangement of concept B (G-Unit street, F phrygian, 90 BPM).
+
+Form (Template A, producer_bible/arrangement_principles.md):
+  intro 4 | hook 8 | verse 16 | hook 8 | verse 16 | hook 8 | outro 4   = 64 bars ~ 2:51
+Rules applied: arrange by subtraction; single-bar kick/808 drop on bar 1 (and bar 9) of every verse; ear candy every 4th bar;
+hook = full motif (octaves) + cello + violin pedal; verse = motif in one octave, thinner, no strings; a reversed-piano swell
+(built from the record's own piano) into every hook; outro ends on a punctuation hit + tail.
+"""
+import sys, os, json
+sys.path.insert(0, 'scripts/engine'); sys.path.insert(0, 'projects/prototype_01')
+import numpy as np, pedalboard as pb
+import dsp
+from dsp import SR
+from render import Song, Track, Note, render_track, mixdown, master_chain, export, auto_balance
+from theory import n
+import concepts as C
+
+BPM = 90.0
+FORM = [('intro', 4), ('hook', 8), ('verse', 16), ('hook', 8), ('verse', 16), ('hook', 8), ('outro', 4)]
+OUT = 'projects/prototype_01/renders/glass_jaw_v3'
+
+M1 = [(0, .22, 'F3', 112), (0.75, .22, 'F3', 96), (1.5, .3, 'Ab3', 108), (2.0, .45, 'Gb3', 116), (2.75, .22, 'F3', 100)]
+M2 = [(0, .22, 'C3', 112), (0.75, .22, 'Db3', 104), (1.5, .3, 'C3', 100), (2.5, .22, 'Eb3', 108), (3.0, .5, 'Db3', 112)]
+B1 = [(0, .7, 'F2', 118), (.75, .6, 'F2', 100), (2.5, 1.0, 'F2', 110)]
+B2 = [(0, .7, 'C2', 116), (.75, .6, 'Db2', 104), (2.5, .5, 'Eb2', 106), (3.0, .9, 'Db2', 110)]
+
+
+def bar_plan():
+    plan = []; bar = 0
+    for sec, L in FORM:
+        for i in range(L):
+            p = dict(bar=bar, sec=sec, i=i, phrase_odd=(bar % 2 == 1))
+            if sec == 'intro':
+                p.update(piano='full' if i >= 2 else 'thin', piano_lp=[700, 1400, 3000, 9000][i], cello=False, strings=False,
+                         kick=False, snare=(i == 3), hats=(i >= 2), roll=(i == 3), bass=False)
+            elif sec == 'hook':
+                p.update(piano='full', piano_lp=None, cello=True, strings=True, kick=True, snare=True, hats=True,
+                         roll=(i % 4 == 3), bass=True, open_hat=(i % 2 == 1))
+            elif sec == 'verse':
+                drop = i in (0, 8)
+                p.update(piano='thin', piano_lp=4500, cello=(i >= 8 and i % 2 == 0), strings=False, kick=not drop, snare=True, hats=True,
+                         roll=(i % 4 == 3), bass=not drop, open_hat=False)
+            else:  # outro
+                p.update(piano='full' if i < 3 else 'last', piano_lp=[9000, 5000, 2500, 1200][i], cello=i < 2, strings=i < 3, kick=i < 2,
+                         snare=i < 2, hats=i < 3, roll=False, bass=i < 2 or i == 3)
+            plan.append(p); bar += 1
+    return plan
+
+
+def build():
+    plan = bar_plan(); bars = len(plan)
+    s = Song(BPM, bars, swing=63); spb = s.spb; T = s.length_s() + 6
+    vk = C.kit('virt')
+    k808 = dsp.kick_808(f0=46, decay=0.3, pitch_drop=3.0, click=0.35, drive_db=8)
+    sn = vk.render_note(40, 125, 0.3); cl = dsp.clap_synth(seed=9)
+    sc = np.zeros((max(len(sn), len(cl)), 2), np.float32); sc[:len(sn)] += sn; sc[:len(cl)] += np.stack([cl, cl], 1) * 0.8
+    hat = dsp.hat_synth(); ohat = dsp.hat_synth(open_=True)
+    shots = {36: np.stack([k808, k808], 1), 38: sc, 42: np.stack([hat, hat], 1), 46: np.stack([ohat, ohat], 1)}
+    K, S, H, P, CE, BL = [], [], [], [], [], []
+    for p in plan:
+        o = p['bar'] * 4; odd = p['phrase_odd']
+        if p['kick']:
+            K += [Note(o + x, .25, 36, 120) for x in (0, 0.75, 2.5)] + ([Note(o + 3.75, .25, 36, 100)] if odd else [])
+        if p['snare']:
+            S += [Note(o + 1, .25, 38, 124), Note(o + 3, .25, 38, 124)]
+        if p['hats']:
+            if p['roll']:
+                H += [Note(o + i * .5, .25, 42, 92) for i in range(6)] + [Note(o + 3 + i * .125, .125, 42, 70 + 6 * i) for i in range(8)]
+            else:
+                H += [Note(o + i * .5, .25, 42, 100 if i % 2 == 0 else 78) for i in range(8)]
+            if p.get('open_hat'): H.append(Note(o + 3.5, .5, 46, 84))
+        mot = M2 if odd else M1
+        if p['piano'] == 'last':
+            P += [Note(o, 3.5, n('F3'), 100), Note(o, 3.5, n('F2'), 96), Note(o, 3.5, n('C4'), 80)]
+        elif p['piano']:
+            for st, du, nm, ve in mot:
+                if p['piano'] == 'full':
+                    P += [Note(o + st, du, n(nm), ve), Note(o + st, du, n(nm) + 12, ve - 14)]
+                else:
+                    P.append(Note(o + st, du, n(nm), ve - 12))
+        if p['cello']:
+            CE += [Note(o + st, du + .1, n(nm) - 12, ve - 8) for st, du, nm, ve in mot]
+        if p['bass']:
+            if p['sec'] == 'outro' and p['i'] == 3:
+                BL.append((o, 3.5, n('F1'), 118))
+            else:
+                BL += [(o + st, du, n(nm) - 12, ve) for st, du, nm, ve in (B2 if odd else B1)]
+    s.tracks = [Track('kick', ('oneshot', shots), K, mono=True),
+                Track('snare', ('oneshot', shots), S, timing_ms=6, send_reverb=0.06,
+                      fx=C.board(pb.HighpassFilter(120), pb.Compressor(threshold_db=-12, ratio=4, attack_ms=3, release_ms=70))),
+                Track('hats', ('oneshot', shots), H, humanize_ms=2, vel_jitter=6, pan=-0.12),
+                Track('piano', ('sfz', C.kit('piano')), P, swing=50, send_reverb=0.12,
+                      fx=C.board(pb.HighpassFilter(150), pb.Compressor(threshold_db=-18, ratio=3, attack_ms=2, release_ms=60)))]
+    stems = {t.name: render_track(s, t, tail_s=6) for t in s.tracks}
+    N = int(T * SR)
+    for k in stems: stems[k] = np.pad(stems[k][:N], ((0, max(0, N - len(stems[k]))), (0, 0)))
+    # piano automation: per-bar low-pass (intro opening / outro closing / verse darker)
+    pz = stems['piano']; out = np.zeros_like(pz); fade = int(0.01 * SR)
+    for p in plan:
+        a = int(s.beat_to_s(p['bar'] * 4, 50) * SR); b = int(s.beat_to_s(p['bar'] * 4 + 4, 50) * SR) if p['bar'] < bars - 1 else N
+        seg = pz[a:b]
+        if p['piano_lp']: seg = dsp.lp(seg, p['piano_lp'], order=2)
+        out[a:b] += seg
+    stems['piano'] = dsp.width(out, 0.4)
+    # cello (VSCO spiccato) and violin pedal
+    cs = C.kit('cello_spic'); cb = np.zeros((N, 2), np.float32)
+    for nt in CE:
+        x = cs.render_note(nt.pitch, nt.vel, nt.dur * spb); st = int(s.beat_to_s(nt.beat, 50) * SR); cb[st:st + len(x)] += x[:N - st]
+    cm = cb.mean(1, keepdims=True); stems['cello'] = dsp.hp(np.concatenate([cm + 0.3 * (cb[:, :1] - cm), cm + 0.3 * (cb[:, 1:] - cm)], 1), 70)
+    vs = C.kit('vln_sus'); vb = np.zeros((N, 2), np.float32)
+    for p in plan:
+        if p['strings'] and p['i'] % 2 == 0:
+            nm = 'Gb5' if (p['i'] // 2) % 2 == 0 else 'F5'
+            x = vs.render_note(n(nm), 66, 2 * 4 * spb); st = int(p['bar'] * 4 * spb * SR); vb[st:st + len(x)] += x[:N - st]
+    stems['strings'] = dsp.width(vb, 0.5)
+    stems['bass'] = dsp.bass_808(BL, spb, T, decay=0.45)[:N]
+    # reversed-piano swell into every hook (the record's own material), last 1 beat before the hook downbeat
+    sw = np.zeros((N, 2), np.float32)
+    hook_starts = [p['bar'] for p in plan if p['sec'] == 'hook' and p['i'] == 0]
+    for hb in hook_starts:
+        d = int(s.beat_to_s(hb * 4, 50) * SR); L = int(1.5 * spb * SR)
+        src = stems['piano'][d:d + L] if hb > 0 else stems['piano'][:L]
+        rev = src[::-1] * np.linspace(0, 1, len(src))[:, None] ** 2
+        st = max(0, d - len(rev)); sw[st:st + len(rev)] += rev[:d - st] if d - st < len(rev) else rev
+    stems['swell'] = dsp.hp(sw, 300)
+    # balance by loudness (same targets as concept B + swell)
+    stems, gains = auto_balance(stems, {'kick': 0.0, 'snare': 0, 'hats': -9, 'piano': -1.5, 'cello': -9, 'strings': -10, 'bass': -4.5, 'swell': -8})
+    s.tracks += [Track('cello', ('func', None), [], send_reverb=0.1), Track('strings', ('func', None), [], send_reverb=0.3),
+                 Track('bass', ('func', None), []), Track('swell', ('func', None), [], send_reverb=0.4)]
+    mix = mixdown(s, stems)
+    # trim to the end of the outro tail (find where the mix decays below -60 dBFS after the last bar)
+    end = int(s.length_s() * SR); tail = np.abs(mix[end:]).max(1); q = np.where(tail > 10 ** (-60 / 20))[0]
+    mix = mix[:end + (q[-1] if len(q) else 0) + int(0.3 * SR)]
+    fade = int(0.3 * SR); mix[-fade:] *= np.linspace(1, 0, fade)[:, None]
+    m = master_chain(mix, target_lufs=-11.0)
+    export(OUT, m)
+    for k, v in stems.items(): export(OUT + '_stems/' + k, v[:len(m)], mp3=False)
+    info = dict(bars=bars, bpm=BPM, form=FORM, duration_s=round(len(m) / SR, 2), gains=gains, metrics=C.metrics(m))
+    json.dump(info, open(OUT + '.json', 'w'), indent=1, default=float)
+    print(json.dumps(info, default=float))
+
+
+if __name__ == '__main__':
+    build()
+
+=== FILE: projects/prototype_01/glass_jaw_v4.py ===
+"""GLASS JAW v4 — rebuilt from the story outward (the King's verdict on v3: soul 10/20, low end "muffled alien").
+
+THE STORY (one city night, 2 AM, G-Unit-era menace)
+  Scene 0  bars  1–4   COLD OPEN   rain-grey street, the piano heard through a car window (low-pass opening), vinyl hiss,
+                                   one 808 note on the last beat = the car door shuts.
+  Scene 1  bars  5–12  THE BLOCK   impact + full drums: the crew steps out. Horns answer the piano in bars 4 and 8 of the hook.
+  Scene 2  bars 13–28  THE WALK    verse: thinner piano, the MC talks. 25–28 = something is pulling up: strings climb a semitone
+                                   ladder (Gb→G→Ab→A), piano repeats its stab on every beat, hats double, snare roll, one beat of
+                                   silence, a reverse swell — then
+  Scene 3  bars 29–36  THE HIT     the drop: 808 glides C1→F1 under an impact, choir pad, horn stabs every 2 bars, open hats.
+  Scene 4  bars 37–52  AFTERMATH   verse 2; bars 45–52 = the switch: half-time (snare on 3 only), piano down an octave at half speed,
+                                   a bell answers, 808 slides, no hats; 51–52 rebuild (hats 16ths, snare roll, riser).
+  Scene 5  bars 53–60  STANDING    hook 3 at full size: shaker 16ths, strings an octave up, horns every bar.
+  Scene 6  bars 61–64  DAWN        drums leave, piano closes through the filter, one last 808 boom + the final chord, the vinyl stops.
+
+LOW END LAW (v3 failure: kick had 78 % of its energy in 40–60 Hz and 0 % above 250 Hz, peak 6 dB under the snare; bass peak −15 dBFS):
+  kick = sampled transient + knock (60–200 Hz) + click (3 kHz), peak ≥ snare peak; 808 = tuned sine with drive (2nd harmonic at ~87 Hz
+  for car systems) + 90 Hz presence, long decay, glides; 808 ducked 6 dB by the kick; mix band shares checked against Candy Shop /
+  In Da Club (40–60 ≈ 25–40 %, 60–150 ≈ 30–40 %, 20–40 ≤ 10 %).
+"""
+import sys, os, json
+sys.path.insert(0, 'scripts/engine'); sys.path.insert(0, 'projects/prototype_01')
+import numpy as np, pedalboard as pb, scipy.signal as ss
+import dsp
+from dsp import SR
+from render import Song, Track, Note, render_track, export
+from theory import n
+from folder_sampler import FolderSampler
+from sfz import SFZ
+import concepts as C
+
+BPM = 90.0
+OUT = 'projects/prototype_01/renders/glass_jaw_v4'
+SURGE = '/usr/share/surge-xt/patches_factory/'
+LIB = 'sound_library/incoming/'
+
+M1 = [(0, .22, 'F3', 112), (0.75, .22, 'F3', 96), (1.5, .3, 'Ab3', 108), (2.0, .45, 'Gb3', 116), (2.75, .22, 'F3', 100)]
+M2 = [(0, .22, 'C3', 112), (0.75, .22, 'Db3', 104), (1.5, .3, 'C3', 100), (2.5, .22, 'Eb3', 108), (3.0, .5, 'Db3', 112)]
+B1 = [(0, .9, 'F1', 118), (.75, .5, 'F1', 104), (2.5, 1.2, 'F1', 112)]
+B2 = [(0, .9, 'C2', 116), (.75, .5, 'Db2', 106), (2.5, .5, 'Eb2', 108), (3.0, .95, 'Db2', 112)]
+HORN = [(3.0, .3, 'F3', 110), (3.5, .3, 'Gb3', 104), (3.75, .25, 'F3', 96)]       # answer in the last beat of the bar
+BELL = [[(1.5, .5, 'Ab5', 90), (2.0, .5, 'Gb5', 84), (2.5, 1.0, 'F5', 96)], [(1.5, .5, 'Db5', 88), (2.5, 1.5, 'C5', 92)]]
+FORM = [('intro', 4), ('hook', 8), ('verse', 16), ('drop', 8), ('verse2', 16), ('hook3', 8), ('outro', 4)]
+
+
+def plan_bars():
+    P = []; bar = 0
+    for sec, L in FORM:
+        for i in range(L):
+            p = dict(bar=bar, sec=sec, i=i, odd=bar % 2 == 1, kick=True, snare=True, hats='8', open_hat=False, shaker=False, roll=False,
+                     piano='thin', piano_lp=None, cello=False, strings=None, choir=False, horn=False, bell=False, bass=True,
+                     half=False, build=False, vinyl=False)
+            if sec == 'intro':
+                p.update(kick=False, snare=False, hats=None, bass=False, piano='full', piano_lp=[500, 900, 1800, 5000][i], vinyl=True)
+            elif sec == 'hook':
+                p.update(piano='full', cello=True, strings='low', horn=(i % 4 == 3), open_hat=p['odd'], roll=(i == 7))
+            elif sec == 'verse':
+                drop = i in (0, 8)
+                p.update(kick=not drop, bass=not drop, piano_lp=4500, cello=(8 <= i < 12 and i % 2 == 0))
+                if i >= 12:  # the build, bars 25-28
+                    p.update(build=True, strings='ladder', piano='stab' if i >= 14 else 'thin', hats='16' if i >= 14 else '8',
+                             roll=(i == 15), kick=(i != 15), bass=(i < 14), open_hat=(i == 13))
+            elif sec == 'drop':
+                p.update(piano='full', cello=True, strings='low', choir=True, horn=(i % 2 == 1), open_hat=True, hats='16' if i >= 4 else '8', roll=(i == 7))
+            elif sec == 'verse2':
+                if i < 8:
+                    p.update(kick=(i != 0), bass=(i != 0), piano_lp=4500, cello=(i >= 4 and i % 2 == 0))
+                elif i < 14:
+                    p.update(half=True, hats=None, shaker=True, piano='half', bell=(i % 2 == 1), strings='lowlow', cello=False)
+                else:
+                    p.update(build=True, hats='16', roll=(i == 15), strings='ladder', piano='stab', bass=(i == 14))
+            elif sec == 'hook3':
+                p.update(piano='full', cello=True, strings='high', choir=True, horn=True, shaker=True, open_hat=p['odd'], hats='16', roll=(i == 7))
+            else:  # outro
+                p.update(kick=False, snare=False, hats='8' if i == 0 else None, bass=(i == 3), piano=['full', 'thin', 'chord', 'chord'][i],
+                         piano_lp=[None, 6000, 2500, 1200][i], strings='low' if i < 2 else None, cello=(i == 0), vinyl=(i >= 2))
+            P.append(p); bar += 1
+    return P
+
+
+# ------------------------------------------------------------------------------------------------ sound design
+def layered_kick():
+    """Sampled transient + knock + click, saturated. Peak-normalised."""
+    rusty = SFZ(LIB + 'karoryfer.big-rusty-drums/Programs/02-basic.sfz')
+    a = rusty.render_note(36, 127, 0.5)
+    if a is None: a = C.kit('virt').render_note(36, 127, 0.5)
+    b = C.kit('virt').render_note(36, 127, 0.5)
+    L = max(len(a), len(b)); k = np.zeros((L, 2), np.float32)
+    k[:len(a)] += dsp.bpf(a, 55, 220, order=2) * 1.2            # knock
+    k[:len(b)] += dsp.hp(b, 1500, order=2) * 0.9                  # click/beater
+    # synthetic thump glues the two (60 Hz, 120 ms)
+    t = np.arange(int(0.25 * SR)) / SR; th = np.sin(2 * np.pi * (54 * (1 + 1.5 * np.exp(-t / 0.012))).cumsum() / SR) * np.exp(-t / 0.07)
+    k[:len(t)] += np.stack([th, th], 1) * 0.55
+    k = dsp.peq(k, 75, 3, 1.0); k = dsp.peq(k, 3200, 4, 1.2); k = dsp.sat(k, 7)
+    k = k[:int(0.45 * SR)] * np.minimum(1, (len(k[:int(0.45 * SR)]) - np.arange(len(k[:int(0.45 * SR)]))) / (0.03 * SR))[:, None]
+    return (k / np.abs(k).max()).astype(np.float32)
+
+
+def layered_snare():
+    vk = C.kit('virt')
+    rim = vk.render_note(40, 127, 0.3); cen = vk.render_note(38, 120, 0.3); cl = dsp.clap_synth(seed=9)
+    t = np.arange(int(0.12 * SR)) / SR; body = np.sin(2 * np.pi * 190 * t) * np.exp(-t / 0.045)
+    L = max(len(rim), len(cen), len(cl)); s = np.zeros((L, 2), np.float32)
+    s[:len(rim)] += rim * 0.9; s[:len(cen)] += cen * 0.5; s[:len(cl)] += np.stack([cl, cl], 1) * 0.7; s[:len(t)] += np.stack([body, body], 1) * 0.5
+    s = dsp.peq(s, 200, 2, 1.2); s = dsp.peq(s, 5000, 3, 0.9); s = dsp.sat(s, 4)
+    return (s / np.abs(s).max()).astype(np.float32)
+
+
+def bass_808_v4(notes, spb, total_s, decay=0.75, drive_db=7, sr=SR):
+    """notes = (beat, dur, midi, vel[, glide_from_midi]). Sine + pitch kick + glide + drive; 2nd-harmonic presence for small speakers."""
+    N = int(total_s * sr); y = np.zeros(N)
+    for nt in sorted(notes):
+        beat, dur, m, vel = nt[:4]; gfrom = nt[4] if len(nt) > 4 else None
+        s = int(beat * spb * sr); L = min(int((dur * spb + 0.15) * sr), N - s)
+        if L <= 0: continue
+        t = np.arange(L) / sr; f0 = 440 * 2 ** ((m - 69) / 12)
+        f = f0 * (1 + 1.4 * np.exp(-t / 0.014))
+        if gfrom is not None:
+            fg = 440 * 2 ** ((gfrom - 69) / 12); g = int(min(L, 0.35 * sr))
+            f[:g] = np.geomspace(fg, f0, g) * (1 + 1.4 * np.exp(-t[:g] / 0.014))
+        x = np.sin(2 * np.pi * np.cumsum(f) / sr) * np.exp(-t / decay) * (vel / 127)
+        x *= np.minimum(1, t / 0.002) * np.minimum(1, (L - np.arange(L)) / (0.03 * sr))
+        y[s:s + L] = x + y[s:s + L] * np.exp(-np.arange(L) / (0.003 * sr))
+    y = dsp.sat(y, drive_db)
+    y2 = np.stack([y, y], 1)
+    y2 = dsp.peq(y2, 88, 1.0, 1.0); y2 = dsp.lp(y2, 2500, order=2)
+    return (y2 / (np.abs(y2).max() + 1e-9)).astype(np.float32)
+
+
+def duck(x, trigger_times, depth_db=-6, att_ms=4, rel_ms=90, sr=SR):
+    env = np.ones(len(x))
+    a = int(att_ms * 1e-3 * sr); r = int(rel_ms * 1e-3 * sr); d = 10 ** (depth_db / 20)
+    for t in trigger_times:
+        i = int(t * sr)
+        if i >= len(x): continue
+        env[i:i + a] = np.minimum(env[i:i + a], np.linspace(1, d, min(a, len(x) - i)))
+        j = i + a; seg = np.linspace(d, 1, min(r, max(0, len(x) - j)))
+        env[j:j + len(seg)] = np.minimum(env[j:j + len(seg)], seg)
+    return x * env[:, None]
+
+
+def riser(dur_s, sr=SR, seed=5):
+    """Band-limited noise sweep 300 → 6000 Hz + rising sine; short, belongs to the drum world."""
+    N = int(dur_s * sr); t = np.arange(N) / sr; rng = np.random.default_rng(seed)
+    nz = rng.standard_normal(N); out = np.zeros(N); hop = 1024
+    for i in range(0, N, hop):
+        fc = 300 * (6000 / 300) ** (i / N); seg = nz[i:i + hop]
+        sos = ss.butter(2, [fc / 1.6, min(fc * 1.6, sr / 2 - 1)], 'bandpass', fs=sr, output='sos')
+        out[i:i + hop] = ss.sosfilt(sos, seg)
+    env = (t / dur_s) ** 2.2
+    y = out / (np.abs(out).max() + 1e-9) * env
+    return np.stack([y, y * 0.9], 1).astype(np.float32)
+
+
+def impact(sr=SR, seed=6):
+    """Sub drop 70 → 32 Hz + saturated noise burst; the 'hit' at a drop."""
+    N = int(1.6 * sr); t = np.arange(N) / sr
+    f = 70 * (32 / 70) ** np.minimum(1, t / 0.5); sub = np.sin(2 * np.pi * np.cumsum(f) / sr) * np.exp(-t / 0.55)
+    nz = dsp.bpf(np.random.default_rng(seed).standard_normal(N), 150, 4000) * np.exp(-t / 0.12)
+    y = dsp.sat(sub * 1.0 + nz * 0.35, 6)
+    return (np.stack([y, y], 1) / np.abs(y).max()).astype(np.float32)
+
+
+def reverse_cymbal(oh, sr=SR):
+    x = oh[::-1].copy(); x = x * np.linspace(0, 1, len(x))[:, None] ** 1.5
+    return dsp.hp(x, 2500)
+
+
+def place(buf, x, t_s):
+    s = int(t_s * SR)
+    if s < 0: x = x[-s:]; s = 0
+    L = min(len(x), len(buf) - s)
+    if L > 0: buf[s:s + L] += x[:L]
+
+
+def mix_bands(x):
+    m = x.mean(1); S = np.abs(np.fft.rfft(m)) ** 2; f = np.fft.rfftfreq(len(m), 1 / SR); tot = S.sum()
+    return {b: round(100 * S[(f >= a) & (f < b)].sum() / tot, 1) for a, b in [(20, 40), (40, 60), (60, 100), (100, 150), (150, 250), (250, 500), (500, 2000), (2000, 8000)]}
+
+
+# ------------------------------------------------------------------------------------------------ build
+def build():
+    P = plan_bars(); bars = len(P)
+    s = Song(BPM, bars, swing=63); spb = s.spb; T = s.length_s() + 7; N = int(T * SR)
+    t_of = lambda beat, sw=63: s.beat_to_s(beat, sw)
+    vk = C.kit('virt')
+    KICK, SNARE = layered_kick(), layered_snare()
+    HAT_C = [vk.render_note(42, v, 0.1) for v in (70, 90, 110)]
+    HAT_O = vk.render_note(46, 100, 0.4)
+    shk = vk.render_note(82, 100, 0.2)
+    if shk is None:
+        shk = np.stack([dsp.hp(dsp.hat_synth(), 6000)] * 2, 1) * 0.6
+    stems = {k: np.zeros((N, 2), np.float32) for k in ('kick', 'snare', 'hats', 'shaker', 'piano', 'cello', 'strings', 'bass', 'fx', 'vinyl')}
+    kick_times = []
+    P_notes, CE, BL, HORN_N, BELL_N, CHOIR_N = [], [], [], [], [], []
+    for p in P:
+        o = p['bar'] * 4; odd = p['odd']; mot = M2 if odd else M1
+        # ---- drums
+        if p['kick']:
+            if p['half']:
+                kt = (0, 2.5) if not odd else (0, 1.75, 2.5)
+            elif p['build'] and p['i'] in (14,) and p['sec'] == 'verse':
+                kt = (0, 1, 2, 3)
+            else:
+                kt = (0, 0.75, 2.5) + ((3.75,) if odd else ())
+            for x in kt:
+                tt = t_of(o + x); kick_times.append(tt); place(stems['kick'], KICK * (1.0 if x == 0 else 0.92), tt)
+        if p['snare']:
+            st = (2,) if p['half'] else (1, 3)
+            for x in st: place(stems['snare'], SNARE, t_of(o + x) + 0.006)
+        if p['roll']:
+            for j in range(8):
+                v = 0.25 + 0.75 * j / 7
+                place(stems['snare'], SNARE * v * 0.8, t_of(o + 3 + j * 0.125))
+        if p['hats'] == '8':
+            for i in range(8):
+                v = 2 if i % 2 == 0 else 0; place(stems['hats'], HAT_C[v] * (0.8 if i % 2 else 1), t_of(o + i * .5))
+        elif p['hats'] == '16':
+            for i in range(16):
+                v = 2 if i % 4 == 0 else (1 if i % 2 == 0 else 0); place(stems['hats'], HAT_C[v] * (0.7 + 0.3 * (i % 4 == 0)), t_of(o + i * .25))
+        if p['open_hat']: place(stems['hats'], HAT_O * 0.8, t_of(o + 3.5))
+        if p['shaker']:
+            for i in range(16): place(stems['shaker'], shk * (0.9 if i % 2 == 0 else 0.55), t_of(o + i * .25))
+        # ---- piano
+        if p['piano'] == 'full':
+            for st_, du, nm, ve in mot: P_notes += [Note(o + st_, du, n(nm), ve), Note(o + st_, du, n(nm) + 12, ve - 14)]
+        elif p['piano'] == 'thin':
+            for st_, du, nm, ve in mot: P_notes.append(Note(o + st_, du, n(nm), ve - 12))
+        elif p['piano'] == 'stab':
+            for b_ in range(4): P_notes += [Note(o + b_, .2, n('F3'), 112), Note(o + b_ + .5, .18, n('Gb3'), 100)]
+        elif p['piano'] == 'half':
+            half = M1 if (p['i'] // 2) % 2 == 0 else M2
+            k2 = (p['i'] % 2) * 2  # which half of the doubled motif this bar carries
+            for st_, du, nm, ve in half:
+                st2 = st_ * 2
+                if k2 <= st2 < k2 + 4: P_notes += [Note(o + st2 - k2, du * 2, n(nm) - 12, ve - 6), Note(o + st2 - k2, du * 2, n(nm), ve - 20)]
+        elif p['piano'] == 'chord':
+            if p['i'] == 2: P_notes += [Note(o, 3.8, n('F2'), 92), Note(o, 3.8, n('C3'), 84), Note(o, 3.8, n('Gb3'), 88), Note(o, 3.8, n('F4'), 78)]
+            else: P_notes += [Note(o, 6, n('F2'), 96), Note(o, 6, n('C3'), 86), Note(o, 6, n('F3'), 90), Note(o, 6, n('Ab4'), 76)]
+        if p['cello']: CE += [Note(o + st_, du + .1, n(nm) - 12, ve - 8) for st_, du, nm, ve in mot]
+        if p['horn']: HORN_N += [Note(o + st_, du, n(nm), ve) for st_, du, nm, ve in HORN]
+        if p['bell']: BELL_N += [Note(o + st_, du, n(nm), ve) for st_, du, nm, ve in BELL[(p['i'] // 2) % 2]]
+        if p['choir']: CHOIR_N += [Note(o, 4.1, n(x), 70) for x in (('F3', 'C4', 'Gb4') if not odd else ('C3', 'Ab3', 'Db4'))]
+        # ---- bass
+        if p['bass']:
+            if p['sec'] == 'outro': BL.append((o, 5.0, n('F1'), 124))
+            elif p['half']:
+                BL += [(o, 2.2, n('F1'), 118, n('Db1') if odd else None), (o + 2.5, 1.3, n('Db1') if odd else n('F1'), 108)] if not odd else [(o, 2.2, n('C2'), 116, n('F1')), (o + 2.5, 1.3, n('Db2'), 108)]
+            elif p['sec'] in ('drop',) and p['i'] == 0:
+                BL += [(o, 1.4, n('F1'), 124, n('C1')), (o + 2.5, 1.2, n('F1'), 112)]
+            else:
+                BL += [(o + st_, du, n(nm), ve) for st_, du, nm, ve in (B2 if odd else B1)]
+        if p['sec'] == 'intro' and p['i'] == 3: BL.append((o + 3, 1.0, n('F1'), 110))
+        # ---- vinyl & fx events
+        if p['vinyl']: place(stems['vinyl'], dsp.vinyl(int(4 * spb * SR), level_db=-30, seed=p['bar']), t_of(o, 50))
+    # strings
+    vs = C.kit('vln_sus')
+    def vln(nm, bar, bars_, vel=66, oct_=0):
+        x = vs.render_note(n(nm) + oct_, vel, bars_ * 4 * spb); place(stems['strings'], x, bar * 4 * spb)
+    for p in P:
+        st = p['strings']
+        if st == 'low' and p['i'] % 2 == 0: vln('Gb5' if (p['i'] // 2) % 2 == 0 else 'F5', p['bar'], 2)
+        elif st == 'high' and p['i'] % 2 == 0: vln('Gb5' if (p['i'] // 2) % 2 == 0 else 'F5', p['bar'], 2, 74, 12)
+        elif st == 'lowlow' and p['i'] % 2 == 0: vln('Gb4', p['bar'], 2, 60)
+        elif st == 'ladder':
+            j = p['i'] - 12 if p['sec'] == 'verse' else 2 + (p['i'] - 14)
+            vln(['Gb5', 'G5', 'Ab5', 'A5'][j], p['bar'], 1, 70 + 4 * j)
+    # clean stems of the two 'build' bars 14 & 15 of verse2 that mis-index ladder (safe: ladder j in 0..3 handled)
+    # cello
+    cs = C.kit('cello_spic')
+    for nt in CE: place(stems['cello'], cs.render_note(nt.pitch, nt.vel, nt.dur * spb), t_of(nt.beat, 50))
+    stems['cello'] = dsp.width(dsp.hp(stems['cello'], 70), 0.3)
+    # piano (sampled, per-bar filter automation)
+    pz = render_track(s, Track('piano', ('sfz', C.kit('piano')), P_notes, swing=50, fx=C.board(pb.HighpassFilter(140), pb.Compressor(threshold_db=-18, ratio=3, attack_ms=2, release_ms=60))), tail_s=7)[:N]
+    pz = np.pad(pz, ((0, N - len(pz)), (0, 0))); out = np.zeros_like(pz)
+    for p in P:
+        a = int(t_of(p['bar'] * 4, 50) * SR); b = int(t_of(p['bar'] * 4 + 4, 50) * SR) if p['bar'] < bars - 1 else N
+        seg = pz[a:b]
+        if p['piano_lp']: seg = dsp.lp(seg, p['piano_lp'], order=2)
+        out[a:b] += seg
+    stems['piano'] = dsp.width(out, 0.4)
+    # horns (VSCO F horn staccato), bell + choir (Surge)
+    hs = FolderSampler(LIB + 'VSCO-2-CE/Brass/F Horn/stac', release=0.2)
+    hb = np.zeros((N, 2), np.float32)
+    for nt in HORN_N:
+        for oc in (0, 12): place(hb, hs.render_note(nt.pitch + oc, nt.vel, nt.dur * spb) * (1 if oc == 0 else 0.6), t_of(nt.beat, 50))
+    stems['horns'] = dsp.width(dsp.hp(hb, 180), 0.5)
+    bell = render_track(s, Track('bell', ('vst', 'Surge XT.vst3', SURGE + 'Plucks/Bell 1.fxp', None), BELL_N, swing=50, pan=0.25), tail_s=7)[:N]
+    stems['bell'] = np.pad(dsp.hp(bell, 400), ((0, N - len(bell)), (0, 0)))
+    choir = render_track(s, Track('choir', ('vst', 'Surge XT.vst3', SURGE + 'Pads/Retro Choir.fxp', None), CHOIR_N, swing=50), tail_s=7)[:N]
+    stems['choir'] = dsp.width(dsp.lp(dsp.hp(np.pad(choir, ((0, N - len(choir)), (0, 0))), 250), 3500), 0.7)
+    # bass 808 + duck by kick
+    stems['bass'] = duck(bass_808_v4(BL, spb, T)[:N], kick_times)
+    # FX: impacts at bar 5, 29, 53; reverse cymbal into 5/29/53; risers into 29 and 53; one beat of silence before 29 & 53 (applied below)
+    IMP = impact(); RC = reverse_cymbal(HAT_O); RS = riser(4 * spb)
+    for hb_ in (4, 28, 52):
+        d = t_of(hb_ * 4, 50); place(stems['fx'], IMP * 0.9, d); place(stems['fx'], RC * 0.7, d - len(RC) / SR)
+        if hb_ > 4:
+            place(stems['fx'], RS * 0.5, d - 4 * spb)
+            src = stems['piano'][int((d - 2 * spb) * SR):int(d * SR)]; rev = src[::-1] * np.linspace(0, 1, len(src))[:, None] ** 2
+            place(stems['fx'], dsp.hp(rev, 300) * 0.8, d - 2 * spb)
+    # the silence beat: everything but fx muted for the last beat before bars 29 and 53
+    for hb_ in (28, 52):
+        a = int(t_of(hb_ * 4 - 1, 50) * SR); b = int(t_of(hb_ * 4, 50) * SR); fade = int(0.008 * SR)
+        for k in stems:
+            if k in ('fx',): continue
+            stems[k][a + fade:b] = 0; stems[k][a:a + fade] *= np.linspace(1, 0, fade)[:, None]
+    # ---- gains (dB) — set by design, then the low end is verified against the reference band shares on the drop
+    G = dict(kick=0.0, snare=-1.0, hats=-5, shaker=-10, piano=-3, cello=-10, strings=-11, bass=-2.0, fx=-6, vinyl=-14, horns=-6, bell=-9, choir=-12)
+    sends = dict(snare=0.07, piano=0.14, cello=0.12, strings=0.35, horns=0.25, bell=0.3, choir=0.25, fx=0.2)
+    def mixed(G):
+        mix = np.zeros((N, 2), np.float32); send = np.zeros((N, 2), np.float32)
+        for k, v in stems.items():
+            g = 10 ** (G[k] / 20); mix += v * g
+            if k in sends: send += v * g * sends[k]
+        rv = C.board(pb.Reverb(room_size=0.42, damping=0.55, wet_level=1.0, dry_level=0.0, width=0.8))(send)
+        mix += dsp.width(dsp.hp(rv, 300), 0.6)
+        return mix
+    a, b = int(t_of(28 * 4, 50) * SR), int(t_of(36 * 4, 50) * SR)
+    # LOW-END LAW, measured on the drop: the 808 is the bass line, so its 35-120 Hz RMS sits +1 dB over the kick's; kick peak = snare peak +1.5 dB.
+    def lowrms(x): return 20 * np.log10(np.sqrt(np.mean(dsp.bpf(x[a:b], 35, 120) ** 2)) + 1e-9)
+    kp = 20 * np.log10(np.abs(stems['kick'][a:b]).max()); sp = 20 * np.log10(np.abs(stems['snare'][a:b]).max())
+    G['kick'] = G['snare'] + 1.5 - (kp - sp)
+    G['bass'] = G['kick'] + lowrms(stems['kick']) + 1.0 - lowrms(stems['bass'])
+    bd = mix_bands(mixed(G)[a:b])
+    print('gains', {k: round(v, 1) for k, v in G.items()}); print('drop bands pre-master', bd)
+    mix = mixed(G)
+    end = int(s.length_s() * SR); tail = np.abs(mix[end:]).max(1); q = np.where(tail > 10 ** (-60 / 20))[0]
+    mix = mix[:end + (q[-1] if len(q) else 0) + int(0.4 * SR)]; fd = int(0.4 * SR); mix[-fd:] *= np.linspace(1, 0, fd)[:, None]
+    # master: gentle glue, soft clip high threshold (keep the 808 shape), true-peak limiter, loudness to -9.6 LUFS
+    y = dsp.compress(mix, thr_db=-16, ratio=1.8, att_ms=40, rel_ms=200, knee_db=8)
+    g = 0.0
+    for _ in range(7):
+        z = dsp.true_peak_limit(dsp.soft_clip(y * 10 ** (g / 20), thr=0.94), -1.0)
+        l = dsp.lufs(z)
+        if abs(l + 10.2) < 0.15: break
+        g += (-10.2 - l)
+    export(OUT, z)
+    for k, v in stems.items(): export(OUT + '_stems/' + k, (v * 10 ** (G[k] / 20))[:len(z)], mp3=False)
+    info = dict(bars=bars, bpm=BPM, form=FORM, duration_s=round(len(z) / SR, 2), gains=G, metrics=C.metrics(z), drop_bands=mix_bands(z[a:b]))
+    json.dump(info, open(OUT + '.json', 'w'), indent=1, default=float); print(json.dumps(info, default=float))
+
+
+if __name__ == '__main__':
+    build()
+

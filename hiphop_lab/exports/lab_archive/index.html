@@ -1,0 +1,127 @@
+<title>Beat Factory Lab</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;900&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one narrow console column — rack of beat "channels" on top, measured reference lanes below, archive manifest last */
+:root{
+  --bg:#ECEAE4; --panel:#F7F6F2; --fg:#1E1F22; --muted:#5E5F63; --line:#CFCCC3; --accent:#9A6A1F; --accent-soft:#E7D7B8;
+  --display:"Big Shoulders Display","Arial Narrow",Impact,sans-serif;
+  --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#17181B; --panel:#212226; --fg:#ECE9E2; --muted:#A3A19B; --line:#34353A; --accent:#D9A752; --accent-soft:#3A3122; color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#17181B; --panel:#212226; --fg:#ECE9E2; --muted:#A3A19B; --line:#34353A; --accent:#D9A752; --accent-soft:#3A3122; color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font:15px/1.55 var(--body)}
+.wrap{max-width:860px;margin:0 auto;padding-block:28px 56px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:grid;gap:36px}
+h1{font:900 clamp(40px,8vw,72px)/0.95 var(--display);letter-spacing:.01em;margin:0;text-transform:uppercase;text-wrap:balance}
+h2{font:700 26px/1.1 var(--display);text-transform:uppercase;letter-spacing:.03em;margin:0 0 12px}
+.lede{color:var(--muted);max-width:62ch;margin:10px 0 0}
+.eyebrow{font:500 12px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+.rack{display:grid;gap:12px}
+.ch{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px;display:grid;gap:10px}
+.ch.main{border-color:var(--accent);box-shadow:inset 4px 0 0 var(--accent)}
+.ch-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px}
+.ch-name{font:700 24px/1 var(--display);text-transform:uppercase;letter-spacing:.02em}
+.tag{font:500 11px var(--mono);letter-spacing:.08em;text-transform:uppercase;background:var(--accent-soft);color:var(--fg);padding:3px 7px;border-radius:3px}
+.ch p{margin:0;color:var(--muted);max-width:68ch}
+.meters{display:flex;flex-wrap:wrap;gap:6px 18px;font:400 12.5px var(--mono);color:var(--muted);font-variant-numeric:tabular-nums}
+.meters b{color:var(--fg);font-weight:500}
+audio{width:100%;height:36px}
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;min-width:620px;font-size:13.5px}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:500 11px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+.laws{display:grid;gap:8px;margin:0;padding-left:1.3em;max-width:70ch}
+.files{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px}
+.file{font:400 13px var(--mono);background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:8px 10px;min-width:0;overflow-wrap:anywhere}
+.file span{display:block;color:var(--muted);font-family:var(--body);font-size:12.5px}
+.note{font-size:13px;color:var(--muted)}
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Hip-hop production lab · 21 references measured · 2026-10-15</div>
+    <h1>Beat Factory Lab</h1>
+    <p class="lede">The first original beats from the factory, the numbers they were built from, and the full archive of code and notes. Everything here was measured by script; the final verdict on every beat is your ear. King's scores so far: A 7/20 · B 10/20 · C 0 · Glass Jaw v3 "soul, but muffled".</p>
+  </header>
+
+  <section>
+    <h2>Beats to judge</h2>
+    <div class="rack">
+      <article class="ch main">
+        <div class="ch-head"><span class="ch-name">Glass Jaw v4</span><span class="tag">full song · 2:52</span><span class="tag">story build</span></div>
+        <p>Rebuilt from the story outward after the King's verdict on v3 (soul 10/20, low end muffled). Three-layer kick, the 808 as the bass line with glides, a semitone-ladder build into a one-beat silence and a drop, a half-time switch with a bell answer, horns and choir in the hooks, dawn outro.</p>
+        <div class="meters"><span>BPM <b>90.0</b></span><span>LUFS <b>−10.3</b></span><span>true peak <b>−1.0 dBTP</b></span><span>40–60 Hz on the drop <b>45%</b></span><span>60–100 Hz <b>35%</b></span><span>crest <b>10.2 dB</b></span></div>
+        <audio controls preload="none" src="glass_jaw_v4.mp3"></audio>
+      </article>
+      <article class="ch">
+        <div class="ch-head"><span class="ch-name">Glass Jaw v3</span><span class="tag">full song · 2:51</span><span class="tag">G-Unit street</span></div>
+        <p>Staccato octave piano in F Phrygian (the ♭2 menace), cello spiccato, violin pedal in the hooks, tuned 808. Intro 4 · Hook 8 · Verse 16 · Hook 8 · Verse 16 · Hook 8 · Outro 4. Kick and 808 drop on bars 1 and 9 of each verse for the MC's entry.</p>
+        <div class="meters"><span>BPM <b>90.0</b></span><span>swing <b>64.7%</b></span><span>LUFS <b>−11.1</b></span><span>true peak <b>−1.0 dBTP</b></span><span>≤150 Hz <b>76.5%</b></span><span>side−mid <b>−15.9 dB</b></span></div>
+        <audio controls preload="none" src="glass_jaw_v3.mp3"></audio>
+      </article>
+      <article class="ch">
+        <div class="ch-head"><span class="ch-name">Concept A · Sunset Ghost</span><span class="tag">8 bars</span><span class="tag">West Coast</span></div>
+        <p>Am9 to D9 Dorian comping, funk bass with chromatic approaches, a whistle lead that answers only in bars 4 and 8.</p>
+        <div class="meters"><span>BPM <b>93.0</b></span><span>LUFS <b>−10.1</b></span><span>≤150 Hz <b>64.7%</b></span><span>centroid <b>2.06 kHz</b></span></div>
+        <audio controls preload="none" src="concept_A.mp3"></audio>
+      </article>
+      <article class="ch">
+        <div class="ch-head"><span class="ch-name">Concept B · Glass Jaw core</span><span class="tag">8 bars</span><span class="tag">G-Unit street</span></div>
+        <p>The loop that became the full song above.</p>
+        <div class="meters"><span>BPM <b>90.0</b></span><span>swing <b>69.2%</b></span><span>LUFS <b>−10.0</b></span><span>≤150 Hz <b>84.1%</b></span></div>
+        <audio controls preload="none" src="concept_B.mp3"></audio>
+      </article>
+      <article class="ch">
+        <div class="ch-head"><span class="ch-name">Concept C · Concrete Psalm</span><span class="tag">8 bars</span><span class="tag">NY boom-bap</span></div>
+        <p>A jazz phrase composed here and pressed into a fake record (tape, vinyl, SP-1200), then chopped in a 2-bar call and response.</p>
+        <div class="meters"><span>BPM <b>87.0</b></span><span>LUFS <b>−10.1</b></span><span>≤150 Hz <b>53.7%</b> (below boom-bap range)</span></div>
+        <audio controls preload="none" src="concept_C.mp3"></audio>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>Seven laws from the references</h2>
+    <ol class="laws">
+      <li>Tempo lane 81–100 BPM, median 93.4. Kendrick's 134 is a 67 BPM half-time feel.</li>
+      <li>The low end owns the record: median 74% of energy at or below 150 Hz. The 250 Hz–2 kHz band stays thin for the rapper.</li>
+      <li>One 2-bar loop runs 60–120 bars. Arrangement happens by taking things away.</li>
+      <li>Single-bar drop-outs mark sections. The MC enters alone and the drums return on bar 2.</li>
+      <li>Swing lives in the hats: Premier 69–74%, West Coast 57–61%, In Da Club bounce 66%.</li>
+      <li>Narrow image: median side−mid −19 dB. 90s Wu-Tang and Nas files are effectively mono.</li>
+      <li>Loud but breathing: modern masters −8 to −10 LUFS with 10.5–13 dB crest.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Archetypes, measured</h2>
+    <div class="tbl"><table>
+      <thead><tr><th>Archetype</th><th>References</th><th>BPM</th><th>Swing %</th><th>≤150 Hz %</th><th>Emotion engine</th></tr></thead>
+      <tbody>
+        <tr><td>West Coast / G-funk</td><td>G Thang, Next Episode, Still D.R.E., Ambitionz</td><td class="num">87–95</td><td class="num">57–73</td><td class="num">61–82</td><td>extended chords or a staccato 2-bar riff, funk bass, sparing portamento lead</td></tr>
+        <tr><td>G-Unit / Storch club</td><td>In Da Club, Candy Shop, Poppin', Lean Back, Why We Thugs</td><td class="num">88–99</td><td class="num">35–66</td><td class="num">31–85</td><td>one hook riff with ♭2 colour, huge sub, sparse kick</td></tr>
+        <tr><td>DJ Premier boom-bap</td><td>N.Y. State of Mind, Nas Is Like, Classic, Seen It All</td><td class="num">84–100</td><td class="num">40–74</td><td class="num">65–80</td><td>2-bar chop as call and response, jazz dissonance, late hats</td></tr>
+        <tr><td>Gritty underground</td><td>Shook Ones II, Survival, Burn</td><td class="num">94–96</td><td class="num">≈59</td><td class="num">78–87</td><td>tiny dissonant loop, busy kick, cold sub</td></tr>
+        <tr><td>Wu-Tang / martial</td><td>Triumph, Ice Cream, God Body</td><td class="num">81–91</td><td class="num">60–66</td><td class="num">69–79</td><td>mono, drums over sample, open fifths, ♭2</td></tr>
+        <tr><td>Soulful / laid-back</td><td>Bitch Don't Kill My Vibe, Blueprint²</td><td class="num">67½–90</td><td class="num">47–72</td><td class="num">50–84</td><td>maj7 harmony, long drumless intros, half-time space</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>Archive</h2>
+    <p class="note">Plain-text backups of the whole lab, stored with this page so a new session can restore it. Each bundle splits into files on <code>=== FILE: path ===</code> lines; <code>restore.py</code> does the split.</p>
+    <div class="files">
+      <div class="file">code_bundle.txt<span>analysis pipeline, render engine, prototype scripts</span></div>
+      <div class="file">docs_bundle.md<span>CLAUDE.md, progress ledger, handoff, Producer's Bible, QC</span></div>
+      <div class="file">track_reports_all.md<span>21 reference reports with measured cards</span></div>
+      <div class="file">tables_bundle.txt<span>archetype matrix, asset manifest with licences, inventory, technical CSV</span></div>
+      <div class="file">archetype_stats.json<span>min / median / max per archetype</span></div>
+      <div class="file">restore.py<span>bundle splitter</span></div>
+    </div>
+  </section>
+</div>
