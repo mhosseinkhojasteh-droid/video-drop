@@ -1,4 +1,5 @@
-"""GOLDEN V — the factory's signature tag (the King + THE GOD OF MUSIC).
+"""GOLDEN V — the factory's signature tag. v2 (King 25 Oct): Kanye-style — very low (−10 st), dark (LP 2.3 kHz), saturated, the word only readable if you know it; NO bell.
+v1 notes: (the King + THE GOD OF MUSIC).
 
 Placed in the last 2 beats before the first big drop: [gold shimmer] + ["Golden V" voice, dark, doubled] + [reversed piano swell
 of the record's own chord] -> 1/16 of silence -> BOOM (the song's impact + kick + 808).
@@ -20,11 +21,11 @@ def _load(p):
     return x
 
 
-def voice_chain(v, semis=-4.0):
+def voice_chain(v, semis=-10.0, lp_hz=2300):
     v = v / (np.abs(v).max() + 1e-9)
     st = np.stack([v, v], 1)
-    b = pb.Pedalboard([pb.PitchShift(semitones=semis), pb.HighpassFilter(160), pb.LowpassFilter(7000),
-                       pb.Compressor(threshold_db=-20, ratio=4, attack_ms=3, release_ms=80), pb.Distortion(drive_db=6)])
+    b = pb.Pedalboard([pb.PitchShift(semitones=semis), pb.HighpassFilter(70), pb.LowpassFilter(lp_hz),
+                       pb.Compressor(threshold_db=-22, ratio=4, attack_ms=5, release_ms=90), pb.Distortion(drive_db=9), pb.LowpassFilter(lp_hz)])
     y = b(st.T, SR).T
     # double: +-9 cents detune, 14 ms offset, panned
     d1 = pb.Pedalboard([pb.PitchShift(semitones=+0.09)])(y.T, SR).T; d2 = pb.Pedalboard([pb.PitchShift(semitones=-0.09)])(y.T, SR).T
@@ -59,13 +60,11 @@ def golden_v_tag(bpm, chord_notes=None, piano=None, voice_wav=None, beats=2.0, s
         p = st + len(vc) - len(throw) + k * dly
         if p + len(throw) > N: break
         out[p:p + len(throw)] += dsp.lp(throw, 4000 / k, order=2) * g; g *= 0.55
-    # 2) gold shimmer: high bell partials (F6/C7/F7) with long decay, starts with the voice
-    t = np.arange(int(2.2 * SR)) / SR
-    bell = sum(a * np.sin(2 * np.pi * f * t) * np.exp(-t / dec) for f, a, dec in ((1396.9, 1.0, 1.1), (2093.0, .5, .7), (2793.8, .35, .5), (4186.0, .18, .3)))
-    bell = dsp.hp(bell, 900) / np.abs(bell).max()
-    bl = np.stack([bell, bell], 1).astype(np.float32)
-    bl = pb.Pedalboard([pb.Reverb(room_size=0.85, wet_level=0.5, dry_level=0.6, width=1.0)])(bl.T, SR).T
-    bs = max(0, st - int(0.12 * SR)); out[bs:bs + len(bl)] += bl[:N - bs] * 0.35
+    # 2) dark air: the voice's own reversed reverb swells INTO the word (no bell, no beep)
+    wet = pb.Pedalboard([pb.Reverb(room_size=0.9, damping=0.8, wet_level=1.0, dry_level=0.0, width=1.0)])(np.pad(vc, ((0, int(1.5 * SR)), (0, 0))).T, SR).T
+    rv = dsp.lp(wet[::-1], 1500, order=2)[-int(min(len(wet), st)):]
+    rv = rv * np.linspace(0, 1, len(rv))[:, None] ** 2
+    out[st - len(rv):st] += rv * 0.35
     # 3) reversed piano swell of the song's chord, landing exactly on the downbeat
     if piano is not None and chord_notes:
         ch = None
