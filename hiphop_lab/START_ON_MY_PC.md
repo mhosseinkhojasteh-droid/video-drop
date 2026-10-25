@@ -1,7 +1,7 @@
 # ادامه‌ی کارخونه‌ی بیت روی کامپیوتر خودت (Cowork یا Claude Code دسکتاپ)
 
 همه‌چیز روی GitHub هست: مخزن `mhosseinkhojasteh-droid/video-drop`، شاخه‌ی `god-of-music-lab`، پوشه‌ی `hiphop_lab/`.
-آخرین وضعیت: **Glass Jaw v8** (نمره‌ی v7 = ۱۵.۵ از ۲۰). هدف: ۲۰ از ۲۰.
+آخرین وضعیت: **Glass Jaw v9** (نسخه‌ی نهایی فعلی v9 (بدون امضا، کالیبره‌شده روی شبکه)). هدف: ۲۰ از ۲۰.
 
 ---
 
@@ -42,9 +42,9 @@ foreach ($r in "sfzinstruments/SalamanderGrandPiano","sfzinstruments/virtuosity_
 ```
 تو THE GOD OF MUSIC هستی (مهارت the-god-of-music، فصل ۱۵ و ۱۵.۱). داری کارخونه‌ی بیت ما رو در همین پوشه ادامه میدی.
 
-اول بخون: CLAUDE.md → PROGRESS.md → HANDOFF.md → producer_bible/producer_bible.md → producer_bible/worlds_of_the_references.md → quality_control/glass_jaw_v4_qc.md → projects/prototype_01/glass_jaw_v8.py
+اول بخون: CLAUDE.md → PROGRESS.md → HANDOFF.md → producer_bible/producer_bible.md → producer_bible/worlds_of_the_references.md → quality_control/glass_jaw_v4_qc.md → projects/prototype_01/glass_jaw_v9.py
 
-محیط ویندوزه. مسیر پلاگین‌ها در scripts/engine/paths.py هست. اگه Surge یا VST3 جای دیگه‌ای نصب شده، متغیرهای HIPHOP_VST3_DIR و HIPHOP_SURGE_PATCHES رو تنظیم کن. اول یک تست کوچیک بگیر: python -I projects/prototype_01/glass_jaw_v8.py. اگه چیزی اجرا نشد، فقط همون بخش رو درست کن و چیز دیگه‌ای رو تغییر نده.
+محیط ویندوزه. مسیر پلاگین‌ها در scripts/engine/paths.py هست. اگه Surge یا VST3 جای دیگه‌ای نصب شده، متغیرهای HIPHOP_VST3_DIR و HIPHOP_SURGE_PATCHES رو تنظیم کن. اول یک تست کوچیک بگیر: python -I projects/prototype_01/glass_jaw_v9.py. اگه چیزی اجرا نشد، فقط همون بخش رو درست کن و چیز دیگه‌ای رو تغییر نده.
 
 وضعیت: Glass Jaw نمره‌ی ۱۳ از ۲۰ گرفت. v6 این‌ها رو درست کرده: یک شبکه‌ی سوئینگ برای همه‌ی سازها، اینترو با تم پیانیستی، امضای GOLDEN V، پایان دایره‌ای. نمره‌ی من برای v6: [نمره و توضیحت رو اینجا بنویس]
 
