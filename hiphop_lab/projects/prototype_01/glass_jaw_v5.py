@@ -17,6 +17,7 @@ What changed (all in this file; sound design helpers reused from v4):
 import sys, os, json, random
 sys.path.insert(0, 'scripts/engine'); sys.path.insert(0, 'projects/prototype_01')
 import numpy as np, pedalboard as pb
+from paths import VST3_DIR, SURGE_DIR
 import dsp
 from dsp import SR
 from render import Song, Track, Note, render_track, export
@@ -27,7 +28,7 @@ import glass_jaw_v4 as V4
 
 BPM = 90.0
 OUT = 'projects/prototype_01/renders/glass_jaw_v5'
-SURGE = '/usr/share/surge-xt/patches_factory/'
+SURGE = SURGE_DIR
 LIB = 'sound_library/incoming/'
 RNG = random.Random(51)
 FORM = [('intro', 4), ('hook', 8), ('verse', 16), ('drop', 8), ('verse2', 16), ('hook3', 8), ('outro', 4)]
@@ -255,7 +256,7 @@ def build():
     for nt in CE: place(stems['cello'], cs.render_note(nt.pitch, nt.vel, nt.dur * spb), t_of(nt.beat, 50))
     stems['cello'] = dsp.width(dsp.hp(stems['cello'], 60), 0.3)
     # -------- piano render: warm tone (gentle comp, tape, top roll-off) + per-bar filter automation
-    tape = pb.load_plugin('/usr/lib/vst3/CHOWTapeModel.vst3')
+    tape = pb.load_plugin(VST3_DIR + 'CHOWTapeModel.vst3')
     pz = render_track(s, Track('piano', ('sfz', C.kit('piano')), PN, swing=50,
                                fx=C.board(pb.HighpassFilter(70), pb.Compressor(threshold_db=-20, ratio=2.5, attack_ms=8, release_ms=120))), tail_s=9)[:N]
     pz = np.pad(pz, ((0, N - len(pz)), (0, 0)))
@@ -290,7 +291,7 @@ def build():
             if k == 'fx': continue
             stems[k][a + fade:b] = 0; stems[k][a:a + fade] *= np.linspace(1, 0, fade)[:, None]
     # -------- drum bus: small room + parallel compression (natural, glued)
-    room = pb.load_plugin('/usr/lib/vst3/DragonflyRoomReverb.vst3')
+    room = pb.load_plugin(VST3_DIR + 'DragonflyRoomReverb.vst3')
     drum_keys = ('kick', 'snare', 'hats', 'toms', 'cymbals', 'shaker')
     G = dict(kick=0.0, snare=-1.0, hats=-6, shaker=-11, toms=-4, cymbals=-12, piano=-2.5, cello=-11, strings=-11, bass=-2.0, fx=-6,
              vinyl=-15, horns=-7, bell=-9, choir=-12, drone=-14)

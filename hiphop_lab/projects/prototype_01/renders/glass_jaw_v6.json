@@ -1,0 +1,74 @@
+{
+ "bars": 68,
+ "bpm": 90.0,
+ "form": [
+  [
+   "intro",
+   8
+  ],
+  [
+   "hook",
+   8
+  ],
+  [
+   "verse",
+   16
+  ],
+  [
+   "drop",
+   8
+  ],
+  [
+   "verse2",
+   16
+  ],
+  [
+   "hook3",
+   8
+  ],
+  [
+   "outro",
+   4
+  ]
+ ],
+ "duration_s": 182.79,
+ "gains": {
+  "kick": 2.3,
+  "snare": -1.0,
+  "hats": -6.0,
+  "shaker": -11.0,
+  "toms": -4.0,
+  "cymbals": -12.0,
+  "piano": -2.5,
+  "cello": -11.0,
+  "strings": -11.0,
+  "bass": -5.2,
+  "fx": -6.0,
+  "vinyl": -15.0,
+  "horns": -7.0,
+  "bell": -9.0,
+  "choir": -12.0,
+  "drone": -14.0
+ },
+ "metrics": {
+  "lufs": -10.27,
+  "true_peak_dbtp": -0.99,
+  "crest_db": 9.9,
+  "low_le150_pct": 91.0,
+  "mid_250_2k_pct": 3.5,
+  "centroid_hz": 141.0,
+  "side_minus_mid_db": -23.8,
+  "lr_correlation": 0.992
+ },
+ "drop_bands": {
+  "40": 2.2,
+  "60": 46.8,
+  "100": 37.1,
+  "150": 4.7,
+  "250": 3.8,
+  "500": 1.1,
+  "2000": 3.2,
+  "8000": 1.0
+ },
+ "piano_notes": 1126
+}

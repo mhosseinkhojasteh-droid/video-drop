@@ -3,7 +3,10 @@
 Drive home folder: HIPHOP_PRODUCTION_LAB  id=1dSnKzEuPE5CcgfK6YK1Ttg5HOYZk9zWc
 Archive (all code/docs/reports/beats): https://claude.ai/artifact/DXg1RBrxMn2mqBEky4VAZB  · Drive README id=1PQCQbdSXhdJjUDgtxUA5b8cWm-mhT5KC
 
-## State (2026-10-16)
+## State (2026-10-25)
+Glass Jaw v6 delivered (one grid, theme intro, GOLDEN V tag, circular ending). Continue on the King's PC with START_ON_MY_PC.md.
+
+## Older state (2026-10-16)
 Glass Jaw v4 delivered (story build). Waiting for the King's ear on: 808 weight, half-time switch, horns, length.
 
 ## Previous state

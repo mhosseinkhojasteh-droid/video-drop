@@ -9,6 +9,7 @@ All motifs are written here from scratch (no reference melody, riff or sample). 
 import sys, os, json
 sys.path.insert(0, 'scripts/engine')
 import numpy as np, pedalboard as pb
+from paths import VST3_DIR, SURGE_DIR
 import dsp
 from dsp import SR
 from render import Song, Track, Note, render_track, mixdown, master_chain, export, auto_balance
@@ -18,7 +19,7 @@ from theory import n, chord
 
 LIB = 'sound_library/incoming/'
 OUT = 'projects/prototype_01/renders/'
-SURGE = '/usr/share/surge-xt/patches_factory/'
+SURGE = SURGE_DIR
 
 _cache = {}
 
@@ -176,7 +177,7 @@ def concept_C(bars=8):
     rec = mixdown(rec_song, stems)
     rec = rec[:int(rec_song.length_s() * SR)]
     # 'press the record': tape, band-limit, vinyl, then sample it into an SP-1200
-    tape = pb.load_plugin('/usr/lib/vst3/CHOWTapeModel.vst3')
+    tape = pb.load_plugin(VST3_DIR + 'CHOWTapeModel.vst3')
     rec = tape(rec.T.astype(np.float32), SR).T
     rec = dsp.bpf(rec, 90, 7000, order=2) + dsp.vinyl(len(rec), level_db=-34)
     rec = dsp.vintage(rec / (np.abs(rec).max() + 1e-9) * 0.8, 'sp1200')

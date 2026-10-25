@@ -249,3 +249,11 @@ For every music video you are station 1 of `D:\Claude Command Center\VIDEO\SOUL\
 **Measured tunings:** Growlybass SFZ 1 octave low (key_offset +12); VSCO-2-CE strings/brass names 1 octave low (+12), harp correct; Salamander piano very wide (width 0.4).
 
 **King's scores:** A 7/20, B 10/20 (only pass), C 0; Glass Jaw v3 soulful but muffled → v4 rebuilt from story. No warez (tsvst.ir/RLTS/R2R). The model measures; the King's blind ear is the only pass.
+
+### 15.1 Lessons of Glass Jaw v4→v6 (King's scores: v4 12/20, v5 13/20; v6 awaiting)
+- **ONE GRID LAW.** Every part (kick, hats, 808, piano, horns, strings) is placed through the same swing mapper (v6: `SWB`, swing 57 %). v5 swung the kick on 1a/4a but not the 808 = ~40 ms flam → the King heard "two machines playing against each other / off-beat". Piano lay-back ≤ 3 ms, jitter ≤ 2 ms; humanise velocity more than time.
+- **INTRO LAW.** The intro carries the soul or the beat fails (v5 lost points only there). Open with the most emotional musical idea (v6: the pianist cadence Dbmaj7 → C7b9 → Fm(add9), rolled like a hand), then the riff behind glass + heartbeat, then a teaser of the best later moment (crime ladder), then the SIGNATURE, a 1/16 breath, BOOM. Intro energy must rise bar by bar (measure per-bar RMS).
+- **ENDING LAW.** Never brake/tape-stop the whole beat into silence ("the song just fell"). End with a one-beat stop → impact → the intro theme returns (full circle) → last 808.
+- **Musician piano.** Two hands, voiced triads with the melody on top +8 vel, grace-note appoggiaturas, rolled chords 6–14 ms, 4 riff variants so it never bores; fast stab bursts = excitement (King liked them). Drums: velocity-layer round-robins, ghost notes, crash after fills, tom/snare phrase fills — NEVER an equal-velocity 32nd roll ("a child hitting the drum").
+- **GOLDEN V SIGNATURE** (`scripts/engine/signature.py`): gold bell shimmer + "Golden V" dark doubled voice with dotted-1/8 echo throw + reversed piano swell of the song's own chord, last 2 beats before the first drop, 1/16 silence, then the boom. Current voice = espeak placeholder → replace with the King's real recording (`voice_wav=`).
+- Portability: plugin paths in `scripts/engine/paths.py` (env HIPHOP_VST3_DIR, HIPHOP_SURGE_PATCHES).

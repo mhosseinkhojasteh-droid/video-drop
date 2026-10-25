@@ -21,6 +21,7 @@ LOW END LAW (v3 failure: kick had 78 % of its energy in 40–60 Hz and 0 % above
 import sys, os, json
 sys.path.insert(0, 'scripts/engine'); sys.path.insert(0, 'projects/prototype_01')
 import numpy as np, pedalboard as pb, scipy.signal as ss
+from paths import VST3_DIR, SURGE_DIR
 import dsp
 from dsp import SR
 from render import Song, Track, Note, render_track, export
@@ -31,7 +32,7 @@ import concepts as C
 
 BPM = 90.0
 OUT = 'projects/prototype_01/renders/glass_jaw_v4'
-SURGE = '/usr/share/surge-xt/patches_factory/'
+SURGE = SURGE_DIR
 LIB = 'sound_library/incoming/'
 
 M1 = [(0, .22, 'F3', 112), (0.75, .22, 'F3', 96), (1.5, .3, 'Ab3', 108), (2.0, .45, 'Gb3', 116), (2.75, .22, 'F3', 100)]

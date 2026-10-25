@@ -5,12 +5,13 @@ pattern can be rendered straight, MPC-swung, or laid-back without touching the n
 """
 import os, json, random
 import numpy as np, soundfile as sf
+from paths import VST3_DIR, SURGE_DIR
 import pedalboard
 from mido import Message
 import dsp
 from dsp import SR
 
-VST = '/usr/lib/vst3/'
+VST = VST3_DIR
 
 
 class Note:

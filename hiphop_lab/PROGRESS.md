@@ -31,3 +31,8 @@
 - Glass Jaw v4 built from a written story (projects/prototype_01/glass_jaw_v4.py, quality_control/glass_jaw_v4_qc.md).
 - New bible chapter: producer_bible/worlds_of_the_references.md (the world each reference builds + THE LAW OF THE STORY).
 - Engine lesson: never balance sub-bass stems by LUFS; use peak/band-RMS rules (kick peak = snare +1.5 dB; 808 low-band RMS = kick +1 dB).
+
+## 2026-10-25 — v4 12/20, v5 13/20 → v6
+- v5: two-hand humanised piano, natural drums, musical fills, new intro, pianist coda + tape stop. King: intro weak, some hits off-beat, outro tape-stop bad, the final piano was the best part.
+- v6: one swing grid for all parts (root cause of "off-beat": 808 unswung vs swung kick), intro = the pianist theme + riff behind glass + crime teaser + GOLDEN V tag + 1/16 breath + boom; outro = one-beat stop, impact, theme returns. 68 bars, 3:03, -10.3 LUFS, -1 dBTP.
+- New: scripts/engine/signature.py (GOLDEN V tag), scripts/engine/paths.py (Windows-portable plugin paths).
