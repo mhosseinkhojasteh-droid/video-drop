@@ -21,11 +21,11 @@ def _load(p):
     return x
 
 
-def voice_chain(v, semis=-10.0, lp_hz=2300):
+def voice_chain(v, semis=-10.0, lp_hz=2300, drive_db=9.0):
     v = v / (np.abs(v).max() + 1e-9)
     st = np.stack([v, v], 1)
     b = pb.Pedalboard([pb.PitchShift(semitones=semis), pb.HighpassFilter(70), pb.LowpassFilter(lp_hz),
-                       pb.Compressor(threshold_db=-22, ratio=4, attack_ms=5, release_ms=90), pb.Distortion(drive_db=9), pb.LowpassFilter(lp_hz)])
+                       pb.Compressor(threshold_db=-22, ratio=4, attack_ms=5, release_ms=90), pb.Distortion(drive_db=drive_db), pb.LowpassFilter(lp_hz)])
     y = b(st.T, SR).T
     # double: +-9 cents detune, 14 ms offset, panned
     d1 = pb.Pedalboard([pb.PitchShift(semitones=+0.09)])(y.T, SR).T; d2 = pb.Pedalboard([pb.PitchShift(semitones=-0.09)])(y.T, SR).T
@@ -34,7 +34,8 @@ def voice_chain(v, semis=-10.0, lp_hz=2300):
     return y + 0.45 * dbl
 
 
-def golden_v_tag(bpm, chord_notes=None, piano=None, voice_wav=None, beats=2.0, seed=7):
+def golden_v_tag(bpm, chord_notes=None, piano=None, voice_wav=None, beats=2.0, seed=7, style='dark'):
+    """style='dark' (v7, Kanye-low, saturated) or 'soft' (v8, King 25 Oct: for soft/artistic beats — warm whisper, −5 st, no distortion, halo reverb)."""
     """Return (audio, lead_s): audio starts lead_s seconds before the target downbeat and its tail spills past it."""
     spb = 60.0 / bpm; lead = beats * spb; tail = 2.5
     N = int((lead + tail) * SR); out = np.zeros((N, 2), np.float32)
@@ -44,8 +45,16 @@ def golden_v_tag(bpm, chord_notes=None, piano=None, voice_wav=None, beats=2.0, s
         v = _load(voice_wav)
     else:
         raw = _load(TAG_DIR + 'golden_raw.wav'); wh = _load(TAG_DIR + 'golden_whisper.wav')
-        L = max(len(raw), len(wh)); v = np.zeros(L, np.float32); v[:len(raw)] += raw; v[:len(wh)] += 0.8 * wh[:L]
-    vc = voice_chain(v)
+        if style == 'soft':
+            v = wh
+        else:
+            L = max(len(raw), len(wh)); v = np.zeros(L, np.float32); v[:len(raw)] += raw; v[:len(wh)] += 0.8 * wh[:L]
+    if style == 'soft':
+        vc = voice_chain(v, semis=-5.0, lp_hz=3600, drive_db=0.0)
+        halo = pb.Pedalboard([pb.Reverb(room_size=0.75, damping=0.6, wet_level=0.35, dry_level=0.8, width=1.0)])
+        vc = halo(np.pad(vc, ((0, int(0.4 * SR)), (0, 0))).T, SR).T
+    else:
+        vc = voice_chain(v)
     # trim silence, fit the phrase so it ends 1/16 before the downbeat
     env = np.abs(vc).max(1); idx = np.where(env > 0.02 * env.max())[0]; vc = vc[idx[0]:idx[-1] + int(0.05 * SR)]
     room = d - int(spb / 4 * SR) - int(0.15 * spb * SR)
